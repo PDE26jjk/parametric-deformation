@@ -22,6 +22,8 @@ _state = {
     "group_rank": {},      # group -> min rank
     "group_props": {},     # group -> Scene bool prop (collapse toggle)
     "suspending": False,
+    "dirty": False,
+    "timer": None,
 }
 
 
@@ -34,11 +36,26 @@ def _preset_dir() -> str:
 
 
 def _param_updated(self, context) -> None:
-    """Live-update callback for every slider property."""
+    """Live-update callback for slider props (debounced via a timer)."""
     if _state["suspending"] or _state["adapter"] is None:
         return
-    if context.scene.pd_live_update:
-        _evaluate_mesh(context)
+    if not context.scene.pd_live_update:
+        return
+    _state["dirty"] = True
+    if _state["timer"] is None:
+        _state["timer"] = bpy.app.timers.register(_flush_timer, first_interval=0.05)
+
+
+def _flush_timer():
+    """Single-shot timer: coalesce bursts of slider changes into one evaluate."""
+    _state["timer"] = None
+    if _state.get("dirty") and _state["adapter"] is not None:
+        _state["dirty"] = False
+        try:
+            _evaluate_mesh(bpy.context)
+        except Exception:
+            pass
+    return None
 
 
 def _register_params(params: list[dict]) -> None:
@@ -204,6 +221,49 @@ class PD_OT_randomize(Operator):
         return {"FINISHED"}
 
 
+class PD_OT_randomize_group(Operator):
+    bl_idname = "pd.randomize_group"
+    bl_label = "Randomize Group"
+
+    group: StringProperty(default="")
+
+    def execute(self, context):
+        _state["suspending"] = True
+        scene = context.scene
+        for p in _state["params"]:
+            if p.get("group", "Params") != self.group:
+                continue
+            pname = _state["prop_names"].get(p["id"])
+            if not pname:
+                continue
+            lo, hi = p.get("min", -1.0), p.get("max", 1.0)
+            setattr(scene, pname, random.uniform(lo, hi))
+        _state["suspending"] = False
+        _evaluate_mesh(context)
+        return {"FINISHED"}
+
+
+class PD_OT_zero_group(Operator):
+    bl_idname = "pd.zero_group"
+    bl_label = "Reset Group"
+
+    group: StringProperty(default="")
+
+    def execute(self, context):
+        _state["suspending"] = True
+        scene = context.scene
+        for p in _state["params"]:
+            if p.get("group", "Params") != self.group:
+                continue
+            pname = _state["prop_names"].get(p["id"])
+            if not pname:
+                continue
+            setattr(scene, pname, p.get("default", 0.0))
+        _state["suspending"] = False
+        _evaluate_mesh(context)
+        return {"FINISHED"}
+
+
 class PD_OT_save_preset(Operator):
     bl_idname = "pd.save_preset"
     bl_label = "Save Preset"
@@ -300,6 +360,9 @@ class PD_PT_main(Panel):
                 icon="TRIA_DOWN" if expanded else "TRIA_RIGHT",
                 emboss=False,
             )
+            group_row = header.row(align=True)
+            group_row.operator("pd.randomize_group", text="R", icon="SHUFFLE").group = group
+            group_row.operator("pd.zero_group", text="0").group = group
             if not expanded:
                 continue
             for p in _state["params"]:
@@ -314,6 +377,8 @@ CLASSES = (
     PD_OT_load_pack,
     PD_OT_evaluate,
     PD_OT_randomize,
+    PD_OT_randomize_group,
+    PD_OT_zero_group,
     PD_OT_save_preset,
     PD_OT_load_preset,
     PD_OT_delete_preset,

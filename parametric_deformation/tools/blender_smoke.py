@@ -57,9 +57,19 @@ def main() -> None:
     prop_name = _state()["prop_names"][identity_id]
     before = [tuple(v.co) for v in obj.data.vertices[:5]]
     setattr(scene, prop_name, getattr(scene, prop_name) + 0.5)
+    from parametric_deformation.ui.panels import _flush_timer
+
+    _flush_timer()  # timers do not run in background mode; flush manually
     after = [tuple(v.co) for v in obj.data.vertices[:5]]
     assert before != after, "live update did not refresh the mesh"
     print("LIVE OK")
+
+    # Group reset: zeroing the Identity group returns the mesh to the pre-live
+    # state without touching other groups.
+    bpy.ops.pd.zero_group(group="Identity")
+    restored = [tuple(v.co) for v in obj.data.vertices[:5]]
+    assert restored == before, "group reset did not restore the mesh"
+    print("GROUP ZERO OK")
 
     # Preset save -> change -> restore -> delete round-trip.
     scene.pd_preset_name = "smoke"
