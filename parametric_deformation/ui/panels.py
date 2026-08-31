@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 
 import bpy
 from bpy.props import BoolProperty, FloatProperty, StringProperty
@@ -33,6 +34,32 @@ def _sanitize(name: str) -> str:
 
 def _preset_dir() -> str:
     return os.path.join(os.path.expanduser("~"), ".parametric_deformation", "presets")
+
+
+_SUBGROUP_KEYWORDS = (
+    ("Chin", ("chin", "jaw")),
+    ("Ears", ("ear",)),
+    ("Eyes", ("eye",)),
+    ("Brows", ("brow",)),
+    ("Nose", ("nose",)),
+    ("Mouth", ("mouth", "lip")),
+    ("Face", ("face", "cheek", "head", "faceline", "mandible")),
+    ("Neck", ("neck",)),
+    ("Chest", ("bust", "chest")),
+    ("Waist/Hips", ("waist", "hip")),
+    ("Shoulders", ("shoulder",)),
+    ("Arms/Hands", ("arm", "hand", "finger", "thumb")),
+    ("Legs/Feet", ("leg", "foot", "thigh", "calf", "knee")),
+    ("Body", ("body", "figure", "height", "slender", "whole")),
+)
+
+
+def _subgroup_of(param: dict) -> str:
+    text = f"{param.get('id', '')} {param.get('label', '')}".lower()
+    for name, keywords in _SUBGROUP_KEYWORDS:
+        if any(k in text for k in keywords):
+            return name
+    return "Other"
 
 
 def _param_updated(self, context) -> None:
@@ -350,7 +377,15 @@ class PD_PT_main(Panel):
         col.operator("pd.evaluate", text="Evaluate / Update Mesh")
         col.operator("pd.randomize", text="Randomize")
         col.separator()
+        col.prop(context.scene, "pd_filter", text="Filter (regex)")
 
+        pattern = None
+        filter_text = context.scene.pd_filter.strip()
+        if filter_text:
+            try:
+                pattern = re.compile(filter_text, re.IGNORECASE)
+            except re.error:
+                pattern = None
         for group in _state["groups"]:
             box = col.box()
             show_prop = _state["group_props"].get(group)
@@ -366,13 +401,24 @@ class PD_PT_main(Panel):
                 emboss=False,
             )
             group_row = header.row(align=True)
-            group_row.operator("pd.randomize_group", text="R", icon="SHUFFLE").group = group
+            group_row.operator("pd.randomize_group", text="R").group = group
             group_row.operator("pd.zero_group", text="0").group = group
             if not expanded:
                 continue
+            last_subgroup = None
+            subgroup_drawn = False
             for p in _state["params"]:
                 if p.get("group", "Params") != group:
                     continue
+                if pattern is not None:
+                    text = f"{p.get('id', '')} {p.get('label', '')}"
+                    if not pattern.search(text):
+                        continue
+                subgroup = _subgroup_of(p)
+                if subgroup != last_subgroup:
+                    box.label(text=f"  {subgroup}", icon="LAYER_ACTIVE")
+                    last_subgroup = subgroup
+                    subgroup_drawn = True
                 pname = _state["prop_names"].get(p["id"])
                 if pname:
                     box.prop(context.scene, pname)

@@ -29,6 +29,9 @@ def register() -> None:
     bpy.types.Scene.pd_live_update = BoolProperty(
         name="Live Update", default=True
     )
+    bpy.types.Scene.pd_filter = StringProperty(
+        name="Filter", description="Regex filter for sliders", default=""
+    )
     for cls in CLASSES:
         bpy.utils.register_class(cls)
 
@@ -49,6 +52,8 @@ def unregister() -> None:
         del bpy.types.Scene.pd_preset_name
     if hasattr(bpy.types.Scene, "pd_live_update"):
         del bpy.types.Scene.pd_live_update
+    if hasattr(bpy.types.Scene, "pd_filter"):
+        del bpy.types.Scene.pd_filter
     for pname in list(_state["group_props"].values()):
         if hasattr(bpy.types.Scene, pname):
             delattr(bpy.types.Scene, pname)
