@@ -203,7 +203,7 @@ def validate_pack(pack_dir: str) -> list[str]:
         if pid in seen_ids:
             issues.append(f"duplicate param id {pid}")
         seen_ids.add(pid)
-        for num in ("min", "max", "default", "step"):
+        for num in ("min", "max", "default", "step", "rank"):
             if num in p and not isinstance(p[num], (int, float)):
                 issues.append(f"param {pid}: {num} is not numeric")
         if "kind" in p and p["kind"] not in ("linear", "semantic"):

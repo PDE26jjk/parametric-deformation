@@ -1,4 +1,4 @@
-"""Blender UI: template pack loading, sliders, presets, mesh evaluation."""
+"""Blender UI: template pack loading, collapsible slider groups, live update."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import os
 import random
 
 import bpy
-from bpy.props import FloatProperty, StringProperty
+from bpy.props import BoolProperty, FloatProperty, StringProperty
 from bpy.types import Operator, Panel
 
 from parametric_deformation.core.config import load_pack, validate_pack
@@ -17,7 +17,11 @@ _state = {
     "pack": None,
     "adapter": None,
     "params": [],
-    "prop_names": {},  # param id -> Scene property name
+    "prop_names": {},      # param id -> Scene property name
+    "groups": [],          # group names ordered by rank
+    "group_rank": {},      # group -> min rank
+    "group_props": {},     # group -> Scene bool prop (collapse toggle)
+    "suspending": False,
 }
 
 
@@ -29,16 +33,45 @@ def _preset_dir() -> str:
     return os.path.join(os.path.expanduser("~"), ".parametric_deformation", "presets")
 
 
+def _param_updated(self, context) -> None:
+    """Live-update callback for every slider property."""
+    if _state["suspending"] or _state["adapter"] is None:
+        return
+    if context.scene.pd_live_update:
+        _evaluate_mesh(context)
+
+
 def _register_params(params: list[dict]) -> None:
+    groups: dict[str, int] = {}
+    for p in params:
+        group = p.get("group", "Params")
+        rank = p.get("rank", 1)
+        groups[group] = min(groups.get(group, 10**9), int(rank))
+    ordered = sorted(groups, key=lambda g: (groups[g], g))
+    _state["groups"] = ordered
+    _state["group_rank"] = groups
+    for group in ordered:
+        prop_name = f"pd_show_{_sanitize(group)}"
+        if not hasattr(bpy.types.Scene, prop_name):
+            setattr(
+                bpy.types.Scene,
+                prop_name,
+                BoolProperty(
+                    name=group,
+                    description=group,
+                    default=(groups[group] == 0),
+                ),
+            )
+        _state["group_props"][group] = prop_name
     for p in params:
         pid = p["id"]
-        pname = f"pd_{_sanitize(pid)}"
-        if hasattr(bpy.types.Scene, pname):
-            _state["prop_names"][pid] = pname
+        prop_name = f"pd_{_sanitize(pid)}"
+        if hasattr(bpy.types.Scene, prop_name):
+            _state["prop_names"][pid] = prop_name
             continue
         setattr(
             bpy.types.Scene,
-            pname,
+            prop_name,
             FloatProperty(
                 name=p.get("label", pid),
                 description=p.get("label", pid),
@@ -46,9 +79,10 @@ def _register_params(params: list[dict]) -> None:
                 max=p.get("max", 1.0),
                 default=p.get("default", 0.0),
                 step=p.get("step", 0.01),
+                update=_param_updated,
             ),
         )
-        _state["prop_names"][pid] = pname
+        _state["prop_names"][pid] = prop_name
     _state["params"] = params
 
 
@@ -59,14 +93,35 @@ def _collect_params() -> dict:
     }
 
 
-def _set_params(values: dict) -> None:
+def _set_params(values: dict, suspend: bool = True) -> None:
+    if suspend:
+        _state["suspending"] = True
     scene = bpy.context.scene
     for pid, pname in _state["prop_names"].items():
         if pid in values:
             setattr(scene, pname, float(values[pid]))
+    if suspend:
+        _state["suspending"] = False
 
 
-def _update_mesh(result) -> bpy.types.Object:
+def _evaluate_mesh(context) -> tuple[bool, str]:
+    if _state["adapter"] is None:
+        return False, "load a template pack first"
+    params = _collect_params()
+    num_joints = len(_state["pack"].skeleton.get("joints", []))
+    pose = {
+        "rotations": [[0.0, 0.0, 0.0]] * num_joints,
+        "translation": [0.0, 0.0, 0.0],
+    }
+    try:
+        result = _state["adapter"].evaluate(params, pose)
+    except Exception as exc:
+        return False, str(exc)
+    _update_mesh(context, result)
+    return True, "ok"
+
+
+def _update_mesh(context, result) -> bpy.types.Object:
     name, verts, faces, _uvs = result.meshes[0]
     import numpy as np
 
@@ -75,19 +130,15 @@ def _update_mesh(result) -> bpy.types.Object:
     obj = bpy.data.objects.get("PD_Avatar")
     if obj is None:
         mesh = bpy.data.meshes.new(name)
-        mesh.from_pydata(
-            np.asarray(verts, dtype=np.float64).tolist(), [], faces
-        )
+        mesh.from_pydata(np.asarray(verts, dtype=np.float64).tolist(), [], faces)
         mesh.update()
         obj = bpy.data.objects.new("PD_Avatar", mesh)
-        bpy.context.scene.collection.objects.link(obj)
+        context.scene.collection.objects.link(obj)
     else:
         mesh = obj.data
         if len(mesh.vertices) != len(verts):
             mesh.clear_geometry()
-            mesh.from_pydata(
-                np.asarray(verts, dtype=np.float64).tolist(), [], faces
-            )
+            mesh.from_pydata(np.asarray(verts, dtype=np.float64).tolist(), [], faces)
         else:
             mesh.vertices.foreach_set("co", flat_verts)
         mesh.update()
@@ -123,22 +174,15 @@ class PD_OT_evaluate(Operator):
     bl_label = "Evaluate / Update Mesh"
 
     def execute(self, context):
-        if _state["adapter"] is None:
-            self.report({"ERROR"}, "load a template pack first")
+        ok, message = _evaluate_mesh(context)
+        if not ok:
+            self.report({"ERROR"}, message)
             return {"CANCELLED"}
-        params = _collect_params()
-        num_joints = len(_state["pack"].skeleton.get("joints", []))
-        pose = {
-            "rotations": [[0.0, 0.0, 0.0]] * num_joints,
-            "translation": [0.0, 0.0, 0.0],
-        }
-        try:
-            result = _state["adapter"].evaluate(params, pose)
-        except Exception as exc:
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
-        obj = _update_mesh(result)
-        self.report({"INFO"}, f"{obj.name}: {len(obj.data.vertices)} verts")
+        obj = bpy.data.objects.get("PD_Avatar")
+        self.report(
+            {"INFO"},
+            f"{obj.name if obj else 'mesh'}: {len(obj.data.vertices) if obj else 0} verts",
+        )
         return {"FINISHED"}
 
 
@@ -147,6 +191,7 @@ class PD_OT_randomize(Operator):
     bl_label = "Randomize"
 
     def execute(self, context):
+        _state["suspending"] = True
         scene = context.scene
         for p in _state["params"]:
             pname = _state["prop_names"].get(p["id"])
@@ -154,6 +199,8 @@ class PD_OT_randomize(Operator):
                 continue
             lo, hi = p.get("min", -1.0), p.get("max", 1.0)
             setattr(scene, pname, random.uniform(lo, hi))
+        _state["suspending"] = False
+        _evaluate_mesh(context)
         return {"FINISHED"}
 
 
@@ -186,6 +233,7 @@ class PD_OT_load_preset(Operator):
             return {"CANCELLED"}
         with open(path, "r", encoding="utf-8") as fh:
             _set_params(json.load(fh))
+        _evaluate_mesh(context)
         return {"FINISHED"}
 
 
@@ -233,21 +281,33 @@ class PD_PT_main(Panel):
         row.operator("pd.delete_preset", text="Delete").preset_name = (
             context.scene.pd_preset_name
         )
+        col.prop(context.scene, "pd_live_update", text="Live Update")
         col.operator("pd.evaluate", text="Evaluate / Update Mesh")
         col.operator("pd.randomize", text="Randomize")
         col.separator()
 
-        groups: dict[str, object] = {}
-        for p in _state["params"]:
-            group = p.get("group", "Params")
-            box = groups.get(group)
-            if box is None:
-                box = col.box()
-                box.label(text=group)
-                groups[group] = box
-            pname = _state["prop_names"].get(p["id"])
-            if pname:
-                box.prop(context.scene, pname)
+        for group in _state["groups"]:
+            box = col.box()
+            show_prop = _state["group_props"].get(group)
+            if not show_prop:
+                continue
+            expanded = getattr(context.scene, show_prop)
+            header = box.row()
+            header.prop(
+                context.scene,
+                show_prop,
+                text=group,
+                icon="TRIA_DOWN" if expanded else "TRIA_RIGHT",
+                emboss=False,
+            )
+            if not expanded:
+                continue
+            for p in _state["params"]:
+                if p.get("group", "Params") != group:
+                    continue
+                pname = _state["prop_names"].get(p["id"])
+                if pname:
+                    box.prop(context.scene, pname)
 
 
 CLASSES = (

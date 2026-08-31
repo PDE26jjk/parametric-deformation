@@ -8,15 +8,15 @@ bl_info = {
     "version": (0, 1, 0),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > PD",
-    "description": "Unified parametric deformation template framework "
-                   "(GNM / VRoid template packs).",
+    "description": "Unified parametric deformation template framework with "
+                   "user-installed template packs.",
     "category": "Mesh",
 }
 
 
 def register() -> None:
     import bpy
-    from bpy.props import StringProperty
+    from bpy.props import BoolProperty, StringProperty
 
     from .ui.panels import CLASSES
 
@@ -25,6 +25,9 @@ def register() -> None:
     )
     bpy.types.Scene.pd_preset_name = StringProperty(
         name="Preset", default="preset"
+    )
+    bpy.types.Scene.pd_live_update = BoolProperty(
+        name="Live Update", default=True
     )
     for cls in CLASSES:
         bpy.utils.register_class(cls)
@@ -44,6 +47,11 @@ def unregister() -> None:
         del bpy.types.Scene.pd_pack_path
     if hasattr(bpy.types.Scene, "pd_preset_name"):
         del bpy.types.Scene.pd_preset_name
+    if hasattr(bpy.types.Scene, "pd_live_update"):
+        del bpy.types.Scene.pd_live_update
+    for pname in list(_state["group_props"].values()):
+        if hasattr(bpy.types.Scene, pname):
+            delattr(bpy.types.Scene, pname)
 
 
 if __name__ == "__main__":

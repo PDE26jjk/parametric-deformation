@@ -1,8 +1,8 @@
-"""Headless Blender smoke test for the Parametric Deformation addon.
+"""Headless Blender smoke test for the Parametric Deformation addon (generic).
 
-Run:
+Usage:
   blender.exe --background --factory-startup --python \
-    parametric_deformation/tools/blender_smoke.py
+    parametric_deformation/tools/blender_smoke.py -- <pack_dir>
 """
 
 from __future__ import annotations
@@ -26,13 +26,15 @@ def _state():
 
 
 def main() -> None:
+    if "--" not in sys.argv or len(sys.argv) < sys.argv.index("--") + 2:
+        raise SystemExit("usage: blender --python blender_smoke.py -- <pack_dir>")
+    pack_dir = os.path.abspath(sys.argv[sys.argv.index("--") + 1])
+
     parametric_deformation.register()
     assert hasattr(bpy.types.Scene, "pd_pack_path"), "scene prop missing"
 
-    pack_dir = os.path.join(ROOT, "templates", "gnm_head")
     result = bpy.ops.pd.load_pack(pack_path=pack_dir)
     assert result == {"FINISHED"}, result
-
     result = bpy.ops.pd.evaluate()
     assert result == {"FINISHED"}, result
     obj = bpy.data.objects.get("PD_Avatar")
@@ -46,11 +48,21 @@ def main() -> None:
     elapsed_ms = (time.perf_counter() - t0) / 20 * 1000.0
     print(f"EVAL_MS {elapsed_ms:.1f}")
 
-    # Preset save -> change -> restore -> delete round-trip.
+    # Live update: setting a slider prop refreshes the mesh without an operator.
     scene = bpy.context.scene
+    scene.pd_live_update = True
+    identity_id = next(
+        p["id"] for p in _state()["params"] if p.get("group") == "Identity"
+    )
+    prop_name = _state()["prop_names"][identity_id]
+    before = [tuple(v.co) for v in obj.data.vertices[:5]]
+    setattr(scene, prop_name, getattr(scene, prop_name) + 0.5)
+    after = [tuple(v.co) for v in obj.data.vertices[:5]]
+    assert before != after, "live update did not refresh the mesh"
+    print("LIVE OK")
+
+    # Preset save -> change -> restore -> delete round-trip.
     scene.pd_preset_name = "smoke"
-    first_id = next(iter(_state()["prop_names"]))
-    prop_name = _state()["prop_names"][first_id]
     original = getattr(scene, prop_name)
     bpy.ops.pd.save_preset(preset_name="smoke")
     setattr(scene, prop_name, original + 0.5)
