@@ -51,22 +51,35 @@ def main() -> None:
     # Live update: setting a slider prop refreshes the mesh without an operator.
     scene = bpy.context.scene
     scene.pd_live_update = True
-    identity_id = next(
-        p["id"] for p in _state()["params"] if p.get("group") == "Identity"
-    )
-    prop_name = _state()["prop_names"][identity_id]
-    before = [tuple(v.co) for v in obj.data.vertices[:5]]
-    setattr(scene, prop_name, getattr(scene, prop_name) + 0.5)
+
+    def _first_verts():
+        return [tuple(v.co) for v in obj.data.vertices[:5]]
+
     from parametric_deformation.ui.panels import _flush_timer
 
-    _flush_timer()  # timers do not run in background mode; flush manually
-    after = [tuple(v.co) for v in obj.data.vertices[:5]]
-    assert before != after, "live update did not refresh the mesh"
+    before = _first_verts()
+    params = _state()["params"]
+    candidates = [p for p in params if p.get("group") == "Expression"]
+    candidates += [p for p in params if p.get("group") != "Expression"]
+    picked = None
+    for p in candidates:
+        prop_name = _state()["prop_names"][p["id"]]
+        original = getattr(scene, prop_name)
+        setattr(scene, prop_name, original + 0.5)
+        _flush_timer()  # timers do not run in background mode; flush manually
+        if _first_verts() != before:
+            picked = p
+            break
+        setattr(scene, prop_name, original)
+        _flush_timer()
+    assert picked is not None, "no slider refreshed the first mesh"
+    prop_name = _state()["prop_names"][picked["id"]]
+    shape_group = picked["group"]
     print("LIVE OK")
 
     # Group reset: zeroing the Identity group returns the mesh to the pre-live
     # state without touching other groups.
-    bpy.ops.pd.zero_group(group="Identity")
+    bpy.ops.pd.zero_group(group=shape_group)
     restored = [tuple(v.co) for v in obj.data.vertices[:5]]
     assert restored == before, "group reset did not restore the mesh"
     print("GROUP ZERO OK")

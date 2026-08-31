@@ -138,28 +138,32 @@ def _evaluate_mesh(context) -> tuple[bool, str]:
     return True, "ok"
 
 
-def _update_mesh(context, result) -> bpy.types.Object:
-    name, verts, faces, _uvs = result.meshes[0]
+def _update_mesh(context, result) -> bpy.types.Object | None:
     import numpy as np
 
-    flat_verts = np.asarray(verts, dtype=np.float64).ravel().tolist()
-    faces = [tuple(int(i) for i in f) for f in faces]
-    obj = bpy.data.objects.get("PD_Avatar")
-    if obj is None:
-        mesh = bpy.data.meshes.new(name)
-        mesh.from_pydata(np.asarray(verts, dtype=np.float64).tolist(), [], faces)
-        mesh.update()
-        obj = bpy.data.objects.new("PD_Avatar", mesh)
-        context.scene.collection.objects.link(obj)
-    else:
-        mesh = obj.data
-        if len(mesh.vertices) != len(verts):
-            mesh.clear_geometry()
+    first = None
+    for i, (name, verts, faces, _uvs) in enumerate(result.meshes):
+        obj_name = "PD_Avatar" if i == 0 else f"PD_Avatar_{name}"
+        flat_verts = np.asarray(verts, dtype=np.float64).ravel().tolist()
+        face_list = [tuple(int(idx) for idx in f) for f in faces]
+        obj = bpy.data.objects.get(obj_name)
+        if obj is None:
+            mesh = bpy.data.meshes.new(name)
             mesh.from_pydata(np.asarray(verts, dtype=np.float64).tolist(), [], faces)
+            mesh.update()
+            obj = bpy.data.objects.new(obj_name, mesh)
+            context.scene.collection.objects.link(obj)
         else:
-            mesh.vertices.foreach_set("co", flat_verts)
-        mesh.update()
-    return obj
+            mesh = obj.data
+            if len(mesh.vertices) != len(verts):
+                mesh.clear_geometry()
+                mesh.from_pydata(np.asarray(verts, dtype=np.float64).tolist(), [], face_list)
+            else:
+                mesh.vertices.foreach_set("co", flat_verts)
+            mesh.update()
+        if first is None:
+            first = obj
+    return first
 
 
 class PD_OT_load_pack(Operator):
@@ -195,11 +199,12 @@ class PD_OT_evaluate(Operator):
         if not ok:
             self.report({"ERROR"}, message)
             return {"CANCELLED"}
-        obj = bpy.data.objects.get("PD_Avatar")
-        self.report(
-            {"INFO"},
-            f"{obj.name if obj else 'mesh'}: {len(obj.data.vertices) if obj else 0} verts",
+        total = sum(
+            len(o.data.vertices)
+            for o in bpy.data.objects
+            if o.name.startswith("PD_Avatar")
         )
+        self.report({"INFO"}, f"{total} verts across PD_Avatar meshes")
         return {"FINISHED"}
 
 
