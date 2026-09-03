@@ -32,6 +32,7 @@ class PackConfig:
     bs_semantic: list[dict] = field(default_factory=list)
     skeleton: dict = field(default_factory=dict)
     bone_deltas: dict = field(default_factory=dict)
+    semantic_map: dict = field(default_factory=dict)
     mesh_descriptors: list[dict] = field(default_factory=list)
     postprocess_steps: list[dict] = field(default_factory=list)
     export_map: dict = field(default_factory=dict)
@@ -92,6 +93,9 @@ def load_pack(pack_dir: str) -> PackConfig:
     bd_path = os.path.join(pack_dir, "lbs", "bone_deltas.json")
     if os.path.exists(bd_path):
         cfg.bone_deltas = _read_json(bd_path)
+    sm_path = os.path.join(pack_dir, "lbs", "semantic_map.json")
+    if os.path.exists(sm_path):
+        cfg.semantic_map = _read_json(sm_path)
     weights_path = os.path.join(pack_dir, "lbs", "weights.npz")
     if os.path.exists(weights_path):
         cfg.weights_file = weights_path

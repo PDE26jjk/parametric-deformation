@@ -176,7 +176,9 @@ def _update_mesh(context, result) -> bpy.types.Object | None:
         obj = bpy.data.objects.get(obj_name)
         if obj is None:
             mesh = bpy.data.meshes.new(name)
-            mesh.from_pydata(np.asarray(verts, dtype=np.float64).tolist(), [], faces)
+            mesh.from_pydata(
+                np.asarray(verts, dtype=np.float64).tolist(), [], face_list
+            )
             mesh.update()
             obj = bpy.data.objects.new(obj_name, mesh)
             context.scene.collection.objects.link(obj)
