@@ -2,7 +2,9 @@
 
 Usage:
   blender.exe --background --factory-startup --python \
-    parametric_deformation/tools/render_preview.py -- <pack_dir> <out.png>
+    parametric_deformation/tools/render_preview.py -- <pack_dir> <out.png> [action_id]
+
+An optional pack action id (e.g. "import_materials") is run before rendering.
 """
 
 from __future__ import annotations
@@ -24,17 +26,27 @@ def main() -> None:
     i = sys.argv.index("--")
     pack_dir = os.path.abspath(sys.argv[i + 1])
     out_png = os.path.abspath(sys.argv[i + 2])
+    action_id = sys.argv[i + 3] if len(sys.argv) > i + 3 else ""
 
     parametric_deformation.register()
+    # --factory-startup leaves the default Cube/Light/Camera around; clear them
+    # so the avatar is not rendered embedded in a cube.
+    for obj in list(bpy.data.objects):
+        bpy.data.objects.remove(obj, do_unlink=True)
     assert bpy.ops.pd.load_pack(pack_path=pack_dir) == {"FINISHED"}
     assert bpy.ops.pd.evaluate() == {"FINISHED"}
+    if action_id:
+        assert bpy.ops.pd.run_action(action_id=action_id) == {"FINISHED"}
 
+    # Packs that ship material slots already carry solid colours; only add a
+    # neutral placeholder for packs that do not.
     material = bpy.data.materials.new("PreviewMat")
     material.use_nodes = True
     bsdf = material.node_tree.nodes.get("Principled BSDF")
     bsdf.inputs[0].default_value = (0.82, 0.74, 0.7, 1.0)
     for obj in bpy.data.objects:
-        if obj.name.startswith("PD_Avatar") and obj.data:
+        if (obj.name.startswith("PD_Avatar") and obj.data
+                and not len(obj.data.materials)):
             obj.data.materials.append(material)
 
     camera = bpy.data.objects.new("PreviewCam", bpy.data.cameras.new("PreviewCam"))

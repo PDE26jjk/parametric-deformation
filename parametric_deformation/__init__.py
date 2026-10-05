@@ -29,6 +29,12 @@ def register() -> None:
     bpy.types.Scene.pd_live_update = BoolProperty(
         name="Live Update", default=True
     )
+    bpy.types.Scene.pd_use_rig = BoolProperty(
+        name="Deform With Bones",
+        description="Let the imported armature deform the mesh; idle pose "
+                    "keeps the evaluated shape",
+        default=True,
+    )
     bpy.types.Scene.pd_filter = StringProperty(
         name="Filter", description="Regex filter for sliders", default=""
     )
@@ -52,6 +58,8 @@ def unregister() -> None:
         del bpy.types.Scene.pd_preset_name
     if hasattr(bpy.types.Scene, "pd_live_update"):
         del bpy.types.Scene.pd_live_update
+    if hasattr(bpy.types.Scene, "pd_use_rig"):
+        del bpy.types.Scene.pd_use_rig
     if hasattr(bpy.types.Scene, "pd_filter"):
         del bpy.types.Scene.pd_filter
     for pname in list(_state["group_props"].values()):

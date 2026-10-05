@@ -36,6 +36,8 @@ class PackConfig:
     mesh_descriptors: list[dict] = field(default_factory=list)
     postprocess_steps: list[dict] = field(default_factory=list)
     export_map: dict = field(default_factory=dict)
+    materials: list[dict] = field(default_factory=list)
+    actions: list[dict] = field(default_factory=list)
     weights_file: str | None = None
 
 
@@ -71,6 +73,7 @@ def load_pack(pack_dir: str) -> PackConfig:
             f"expected {SCHEMA_VERSION}"
         )
     cfg = PackConfig(pack_dir=pack_dir, manifest=manifest)
+    cfg.actions = list(manifest.get("actions", []))
 
     params_path = os.path.join(pack_dir, "params.json")
     if os.path.exists(params_path):
@@ -115,6 +118,16 @@ def load_pack(pack_dir: str) -> PackConfig:
     export_path = os.path.join(pack_dir, "export_map.json")
     if os.path.exists(export_path):
         cfg.export_map = _read_json(export_path)
+
+    # Optional material descriptors (id / color / alpha mode / side).  Packs
+    # without textures still get per-slot solid-colour materials in Blender.
+    materials_path = os.path.join(pack_dir, "materials.json")
+    if os.path.exists(materials_path):
+        payload = _read_json(materials_path)
+        if isinstance(payload, dict):
+            cfg.materials = list(payload.get("materials", []))
+        elif isinstance(payload, list):
+            cfg.materials = list(payload)
     return cfg
 
 
@@ -257,4 +270,19 @@ def validate_pack(pack_dir: str) -> list[str]:
             issues.append(f"postprocess {sid}: missing hook")
         if step.get("kind") not in ("generic", "custom"):
             issues.append(f"postprocess {sid}: kind must be generic or custom")
+
+    seen_actions: set[str] = set()
+    for action in cfg.actions:
+        aid = action.get("id")
+        if not isinstance(aid, str) or not aid:
+            issues.append("action entry missing string id")
+            continue
+        if aid in seen_actions:
+            issues.append(f"duplicate action id {aid}")
+        seen_actions.add(aid)
+        if not action.get("type") and not action.get("handler"):
+            issues.append(f"action {aid}: needs a type or a handler")
+        data = action.get("data")
+        if data and not os.path.exists(os.path.join(pack_dir, data)):
+            issues.append(f"action {aid}: data path missing {data}")
     return issues
