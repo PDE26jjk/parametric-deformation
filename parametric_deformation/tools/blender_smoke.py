@@ -55,7 +55,7 @@ def main() -> None:
     def _first_verts():
         return [tuple(v.co) for v in obj.data.vertices[:5]]
 
-    from parametric_deformation.ui.panels import _flush_timer
+    from parametric_deformation.ui.panels import _flush_timer, _param_poll
 
     before = _first_verts()
     params = _state()["params"]
@@ -66,11 +66,16 @@ def main() -> None:
         prop_name = _state()["prop_names"][p["id"]]
         original = getattr(scene, prop_name)
         setattr(scene, prop_name, original + 0.5)
-        _flush_timer()  # timers do not run in background mode; flush manually
+        # Timers do not run in background mode: drive the poll (which notices
+        # the change now that the sliders have no RNA update callback) and the
+        # debounced evaluate by hand.
+        _param_poll()
+        _flush_timer()
         if _first_verts() != before:
             picked = p
             break
         setattr(scene, prop_name, original)
+        _param_poll()
         _flush_timer()
     assert picked is not None, "no slider refreshed the first mesh"
     prop_name = _state()["prop_names"][picked["id"]]

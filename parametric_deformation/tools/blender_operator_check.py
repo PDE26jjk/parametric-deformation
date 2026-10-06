@@ -22,8 +22,10 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, ROOT)
 
 import bpy  # noqa: E402
+import numpy as np  # noqa: E402
 
 import parametric_deformation  # noqa: E402
+from parametric_deformation.ui import panels  # noqa: E402
 from parametric_deformation.ui.panels import _state  # noqa: E402
 
 
@@ -65,6 +67,80 @@ def main() -> int:
     clear_selection()
     failures += run("evaluate (no active object)", bpy.ops.pd.evaluate)
     failures += run("randomize", bpy.ops.pd.randomize)
+
+    # The sliders carry no RNA update callback any more (a Scene property with
+    # one makes EEVEE re-bake on every step, see docs/vroid.md 7.4), so a
+    # change has to be picked up by the poll timer.  Drive that path directly:
+    # set a value outside the "suspending" window, run the poll and the
+    # debounced evaluate, and require the mesh to actually move.
+    prop = _state["prop_names"]["Arm Length"]
+    body = bpy.data.objects["PD_Avatar_body"]
+    before = np.empty(len(body.data.vertices) * 3, dtype=np.float64)
+    body.data.vertices.foreach_get("co", before)
+    setattr(bpy.context.scene, prop, 0.8)
+    panels._param_poll()          # the poll evaluates on the spot
+    panels._flush_timer()         # (kept as a no-op safety net)
+    after = np.empty(len(body.data.vertices) * 3, dtype=np.float64)
+    body.data.vertices.foreach_get("co", after)
+    moved = float(np.abs(after - before).max())
+    if moved > 1e-4:
+        print(f"OK   poll picks up a slider change (moved {moved * 1000:.1f} mm)")
+    else:
+        failures.append(f"poll did not pick up the slider change ({moved})")
+        print(f"FAIL poll pickup moved={moved}")
+    setattr(bpy.context.scene, prop, 0.0)
+    panels._param_poll()
+    panels._flush_timer()
+
+    # The rest pose must keep following the shape during a live drag (the
+    # original behaviour): the armature bones are rebuilt as part of the same
+    # step that rewrites the mesh.
+    rig = bpy.data.objects["PD_Rig"]
+    head_before = rig.data.bones["J_Bip_L_UpperArm"].head_local.copy()
+    setattr(bpy.context.scene, prop, 0.7)
+    panels._param_poll()
+    panels._flush_timer()
+    head_after = rig.data.bones["J_Bip_L_UpperArm"].head_local.copy()
+    moved_rest = (head_after - head_before).length
+    if moved_rest > 1e-4:
+        print(f"OK   rest pose follows the shape while dragging (moved "
+              f"{moved_rest * 1000:.2f} mm)")
+    else:
+        failures.append(f"rest pose did not follow the shape (moved {moved_rest})")
+        print(f"FAIL rest pose did not follow the shape ({moved_rest})")
+    setattr(bpy.context.scene, prop, 0.0)
+    panels._param_poll()
+    panels._flush_timer()
+    bpy.ops.pd.evaluate()
+
+    # Material-preview rule: while a heavy viewport is open the rest refresh is
+    # skipped during a drag (it costs ~1.2 s there) and applied once the
+    # shading is cheap again.  Headless has no 3D viewport, so patch the probe.
+    original_heavy = panels._heavy_shading
+    try:
+        panels._heavy_shading = lambda: True
+        head_before = rig.data.bones["J_Bip_L_UpperArm"].head_local.copy()
+        setattr(bpy.context.scene, prop, 0.9)
+        panels._param_poll()
+        panels._flush_timer()
+        skipped = _state.get("rig_stale") and (
+            rig.data.bones["J_Bip_L_UpperArm"].head_local - head_before).length < 1e-9
+        panels._heavy_shading = lambda: False
+        panels._param_poll()             # poll notices the cheap shading
+        panels._flush_timer()
+        refreshed = not _state.get("rig_stale") and (
+            rig.data.bones["J_Bip_L_UpperArm"].head_local - head_before).length > 1e-4
+        if skipped and refreshed:
+            print("OK   material-mode drag skips the rest refresh, Solid applies it")
+        else:
+            failures.append(f"material-mode rest rule wrong ({skipped}, {refreshed})")
+            print(f"FAIL material-mode rest rule skipped={skipped} refreshed={refreshed}")
+    finally:
+        panels._heavy_shading = original_heavy
+        setattr(bpy.context.scene, prop, 0.0)
+        panels._param_poll()
+        panels._flush_timer()
+        bpy.ops.pd.evaluate()
     clear_selection()
     for group in groups:
         failures += run(f"randomize_group {group!r}",
@@ -87,6 +163,12 @@ def main() -> int:
         clear_selection()
         failures += run(f"run_action {action_id!r}",
                         lambda a=action_id: bpy.ops.pd.run_action(action_id=a))
+
+    # Viewport outline toggle: only meaningful once the action added the
+    # outline Geometry Nodes modifiers, and it must survive being pressed twice.
+    if _state["pack"].actions:
+        failures += run("toggle_outline (off)", bpy.ops.pd.toggle_outline)
+        failures += run("toggle_outline (on)", bpy.ops.pd.toggle_outline)
 
     # A panel click whose context resolves to a view layer that does not contain
     # the armature (second window / different scene).

@@ -6,6 +6,7 @@ import json
 import os
 import random
 import re
+import time
 
 import bpy
 import numpy as np
@@ -39,6 +40,11 @@ _state = {
     "suspending": False,
     "dirty": False,
     "timer": None,
+    "param_snapshot": {},
+    "mirror_snapshot": {},  # prop name -> (host value, Scene mirror value)
+    "poll_timer": None,
+    "rig_stale": False,
+    "written": {},         # object name -> last vertex array written
 }
 
 
@@ -50,6 +56,10 @@ _AXIS_TO_BLENDER = np.array(
 
 _RIG_NAME = "PD_Rig"
 _RIG_MODIFIER = "PD_Rig"
+#: Bumped whenever the viewport update path changes, so the panel can show
+#: which build is actually loaded (a stale add-on reload looks like "the fix
+#: did nothing").
+BUILD = "2026-10-06d"
 
 # Bones VRoid Studio keeps in its own VRM export (59 skin joints): Root, the
 # humanoid J_Bip_* set without *_end markers, the secondary J_Sec_* bones,
@@ -111,15 +121,217 @@ def _subgroup_of(param: dict) -> str:
     return "Other"
 
 
-def _param_updated(self, context) -> None:
-    """Live-update callback for slider props (debounced via a timer)."""
-    if _state["suspending"] or _state["adapter"] is None:
-        return
-    if not context.scene.pd_live_update:
+#: Slider changes are polled instead of driven by an RNA update callback.
+#: A Python-defined property with ``update=`` makes Blender tag its owner on
+#: every write and EEVEE then rebuilds the MToon material shaders: measured
+#: 204 ms per slider step with the VRM materials versus 6 ms without the
+#: callback (docs/vroid.md 7.4).  The same property with no callback is free, so
+#: the panel detects changes in a light 20 Hz timer.  The *owner* matters just
+#: as much - see _host below.
+_PARAM_POLL_SECONDS = 0.05
+
+#: Delay before a widget write is evaluated.  The callback itself must stay
+#: cheap (the old code ran the whole evaluation - including a bone mode switch -
+#: inside the RNA update callback, which blew up with "mode_set.poll() Context
+#: missing active object"), so it only arms this single-shot timer.
+_SETTLE_SECONDS = 0.01
+
+
+#: Widgets must not be bound to *Scene* properties.
+#:
+#: A UI button always calls ``RNA_property_update()`` (Blender 4.5:
+#: ``editors/interface/interface_handlers.cc`` calls it unconditionally, while a
+#: Python assignment first tests ``RNA_property_update_check()`` in
+#: ``python/intern/bpy_rna.cc``), so touching a Scene-owned widget tags the whole
+#: scene; EEVEE then rebuilds the material shaders of the visible meshes, and
+#: with the VRoid MToon node trees that costs 1.1-2.4 s per slider step
+#: (docs/vroid.md 7.4.9).  The identical property on the master collection costs
+#: 11-13 ms, always exists, is saved with the .blend and is invisible in the UI,
+#: so the panel binds there and the Scene property is kept as a mirror for
+#: scripts, tools and files saved by older revisions.
+_FLAG_PROPS = ("pd_pack_path", "pd_preset_name", "pd_live_update", "pd_use_rig",
+               "pd_filter")
+
+
+def _host(context=None):
+    """RNA owner the panel's widgets write to (cheap depsgraph tag)."""
+    context = context if context is not None else bpy.context
+    scene = getattr(context, "scene", None) or bpy.context.scene
+    return scene.collection
+
+
+def _flag(name: str, context=None):
+    """Read a UI flag through the host, after reconciling it with the mirror."""
+    _sync_host()
+    host = _host(context)
+    if hasattr(host, name):
+        return getattr(host, name)
+    scene = getattr(context, "scene", None) or bpy.context.scene
+    return getattr(scene, name)
+
+
+def _host_updated(_self, _context) -> None:
+    """RNA ``update`` callback of the widget-facing properties.
+
+    Kept deliberately cheap: mark the state dirty and arm a single-shot timer.
+    A burst of widget writes therefore coalesces into one evaluation ~10 ms
+    later, instead of waiting for the 20 Hz poll (which is kept as the fallback
+    for scripts that write the Scene mirror directly).
+    """
+    _schedule_flush()
+
+
+def _schedule_flush() -> None:
+    if _state["suspending"]:
         return
     _state["dirty"] = True
-    if _state["timer"] is None:
-        _state["timer"] = bpy.app.timers.register(_flush_timer, first_interval=0.05)
+    # bpy.app.timers.register() returns None, so the handle *is* the function:
+    # always test with is_registered() instead of storing the return value.
+    if not bpy.app.timers.is_registered(_flush_timer):
+        bpy.app.timers.register(_flush_timer, first_interval=_SETTLE_SECONDS)
+
+
+def _mirror_names() -> list[str]:
+    names = list(_state["prop_names"].values())
+    names += list(_state["group_props"].values())
+    names += list(_FLAG_PROPS)
+    return names
+
+
+def _push_to_host() -> None:
+    """Copy the Scene values onto the widget host and re-baseline the mirror."""
+    host = _host()
+    scene = bpy.context.scene
+    snapshot = {}
+    was_suspending = _state["suspending"]
+    _state["suspending"] = True  # our own writes must not arm the settle timer
+    try:
+        for name in _mirror_names():
+            value = getattr(scene, name, None)
+            if value is None:
+                continue
+            try:
+                setattr(host, name, value)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            snapshot[name] = (value, value)
+    finally:
+        _state["suspending"] = was_suspending
+    _state["mirror_snapshot"] = snapshot
+
+
+def _sync_host() -> None:
+    """Reconcile the widget host and the Scene mirror in both directions.
+
+    Whichever side changed since the last poll wins; if both changed, the host
+    wins because that is the side the user is dragging.
+    """
+    host = _host()
+    scene = bpy.context.scene
+    previous = _state.get("mirror_snapshot") or {}
+    snapshot = {}
+    was_suspending = _state["suspending"]
+    _state["suspending"] = True  # mirror writes must not arm the settle timer
+    try:
+        for name in _mirror_names():
+            host_value = getattr(host, name, None)
+            scene_value = getattr(scene, name, None)
+            if host_value is None or scene_value is None:
+                continue
+            pair = previous.get(name)
+            if pair is None:
+                # First sight of this property: the Scene copy is the one saved
+                # by older revisions, so it wins over a host that is still at
+                # its class default.
+                if host_value != scene_value:
+                    setattr(host, name, scene_value)
+                    host_value = scene_value
+                snapshot[name] = (host_value, scene_value)
+                continue
+            host_changed = host_value != pair[0]
+            scene_changed = scene_value != pair[1]
+            if host_changed and not scene_changed:
+                setattr(scene, name, host_value)
+                scene_value = host_value
+            elif scene_changed and not host_changed:
+                setattr(host, name, scene_value)
+                host_value = scene_value
+            elif host_changed and scene_changed:
+                setattr(scene, name, host_value)
+                scene_value = host_value
+            snapshot[name] = (host_value, scene_value)
+    finally:
+        _state["suspending"] = was_suspending
+    _state["mirror_snapshot"] = snapshot
+
+
+def _collect_snapshot() -> dict:
+    return _collect_params() if _state["prop_names"] else {}
+
+
+def _sync_param_snapshot() -> None:
+    """Remember the current slider values so the poll does not re-fire."""
+    if _state["prop_names"]:
+        _state["param_snapshot"] = _collect_snapshot()
+
+
+def _param_poll():
+    """Repeating timer: notice slider changes without tagging the scene."""
+    try:
+        return _param_poll_body()
+    except Exception as exc:   # never let the timer die: the panel would stop
+        #                          updating without any visible reason
+        _state["last_error"] = f"{type(exc).__name__}: {exc}"
+        print("parametric_deformation:", _state["last_error"])
+        return _PARAM_POLL_SECONDS
+
+
+def _param_poll_body():
+    if _state["adapter"] is None:
+        _state["poll_timer"] = None
+        return None
+    interval = _PARAM_POLL_SECONDS
+    if not _state["suspending"]:
+        # Widget writes land on the host; pull them onto the Scene before the
+        # change test, so the mesh follows the drag.
+        _sync_host()
+        values = _collect_snapshot()
+        if values != _state.get("param_snapshot"):
+            _state["param_snapshot"] = values
+            if _flag("pd_live_update"):
+                # Evaluate right away: the poll itself is the coalescer (20 Hz),
+                # and an extra debounce delay only adds latency to the drag.
+                _state["dirty"] = False
+                start = time.perf_counter()
+                try:
+                    _evaluate_mesh_impl(bpy.context, live=True)
+                except Exception as exc:
+                    _state["last_error"] = f"{type(exc).__name__}: {exc}"
+                    print("parametric_deformation:", _state["last_error"])
+                spent = time.perf_counter() - start
+                _state["eval_ms"] = spent * 1000.0
+                # Back off only for a pathological step.  The old 15 ms
+                # threshold existed for the 1.2 s material-preview stall that
+                # the collection host removed (docs/vroid.md 7.4.10); with it,
+                # a Solid step (rest rebuild ~20 ms + eval ~8 ms) dropped the
+                # poll to 6.7 Hz and the drag felt laggy.
+                if spent > 0.1:
+                    interval = min(0.2, _PARAM_POLL_SECONDS * 4.0)
+        elif _state.get("rig_stale") and not _heavy_shading():
+            # Shading dropped back to Solid/Wireframe: apply the rest refresh
+            # that was skipped while the material preview was open.
+            _schedule_flush()
+    return interval
+
+
+def _start_param_poll() -> None:
+    """Make sure the slider poll is running (it may have died earlier)."""
+    # bpy.app.timers.register() returns None (the function object *is* the
+    # handle), so membership has to be tested against the function itself.
+    if bpy.app.timers.is_registered(_param_poll):
+        return
+    _state["poll_timer"] = bpy.app.timers.register(
+        _param_poll, first_interval=_PARAM_POLL_SECONDS)
 
 
 def _flush_timer():
@@ -128,13 +340,20 @@ def _flush_timer():
     if _state.get("dirty") and _state["adapter"] is not None:
         _state["dirty"] = False
         try:
-            _evaluate_mesh(bpy.context)
+            # The widget wrote the host, so pull it onto the Scene before
+            # evaluating and re-baseline the poll snapshot (otherwise the poll
+            # would evaluate the same values a second time).
+            _sync_host()
+            _state["param_snapshot"] = _collect_snapshot()
+            _evaluate_mesh_impl(bpy.context, live=True)
         except Exception as exc:
             # Never swallow: a silent failure here looks like "dragging a
             # slider only updates the rig".
             _state["last_error"] = f"{type(exc).__name__}: {exc}"
             print("parametric_deformation:", _state["last_error"])
     return None
+
+
 
 
 def _register_params(params: list[dict]) -> None:
@@ -148,37 +367,51 @@ def _register_params(params: list[dict]) -> None:
     _state["group_rank"] = groups
     for group in ordered:
         prop_name = f"pd_show_{_sanitize(group)}"
-        if not hasattr(bpy.types.Scene, prop_name):
-            setattr(
-                bpy.types.Scene,
-                prop_name,
-                BoolProperty(
-                    name=group,
-                    description=group,
-                    default=(groups[group] == 0),
-                ),
-            )
+        previous = getattr(bpy.context.scene, prop_name, None)
+        default = (groups[group] == 0) if previous is None else previous
+        for cls in (bpy.types.Scene, bpy.types.Collection):
+            if hasattr(cls, prop_name):
+                delattr(cls, prop_name)
+            kwargs = {"name": group, "description": group, "default": default}
+            if cls is bpy.types.Collection:
+                # Only the widget-facing copy carries the update callback: on
+                # the Scene it would tag the scene (and EEVEE) on every write.
+                kwargs["update"] = _host_updated
+            setattr(cls, prop_name, BoolProperty(**kwargs))
+        if previous is not None:
+            setattr(bpy.context.scene, prop_name, previous)
+        setattr(_host(), prop_name, default)
         _state["group_props"][group] = prop_name
     for p in params:
         pid = p["id"]
         prop_name = f"pd_{_sanitize(pid)}"
-        if hasattr(bpy.types.Scene, prop_name):
-            _state["prop_names"][pid] = prop_name
-            continue
-        setattr(
-            bpy.types.Scene,
-            prop_name,
-            FloatProperty(
-                name=p.get("label", pid),
-                description=p.get("label", pid),
-                min=p.get("min", -1.0),
-                max=p.get("max", 1.0),
-                default=p.get("default", 0.0),
+        # Always (re)create the property.  A slider property left behind by an
+        # older revision keeps its old ``update=`` callback, and that stale
+        # callback keeps driving the old code path - measured in a live session
+        # as ~1.2 s of main-thread stall per click, invisible to any hook in the
+        # current module (docs/vroid.md 7.4.7).  Values are preserved.
+        previous = getattr(bpy.context.scene, prop_name, None)
+        for cls in (bpy.types.Scene, bpy.types.Collection):
+            if hasattr(cls, prop_name):
+                delattr(cls, prop_name)
+            kwargs = {
+                "name": p.get("label", pid),
+                "description": p.get("label", pid),
+                "min": p.get("min", -1.0),
+                "max": p.get("max", 1.0),
+                "default": p.get("default", 0.0),
                 # step=p.get("step", 0.01), too slow
-                update=_param_updated,
-            ),
-        )
+            }
+            if cls is bpy.types.Collection:
+                kwargs["update"] = _host_updated
+            setattr(cls, prop_name, FloatProperty(**kwargs))
         _state["prop_names"][pid] = prop_name
+        if previous is not None:
+            setattr(bpy.context.scene, prop_name, previous)
+        setattr(
+            _host(), prop_name,
+            previous if previous is not None else p.get("default", 0.0),
+        )
     # Keep equal sub-group labels contiguous: the panel draws one collapsible
     # block per label run, so an unsorted list splits "Body" into several
     # blocks separated by other sliders. Sorting is stable, so the authored
@@ -186,13 +419,21 @@ def _register_params(params: list[dict]) -> None:
     _state["params"] = sorted(
         params, key=lambda p: (p.get("group", "Params"), _subgroup_of(p))
     )
+    _push_to_host()
+    _sync_param_snapshot()
 
 
 def _collect_params() -> dict:
     scene = bpy.context.scene
-    return {
-        pid: getattr(scene, pname) for pid, pname in _state["prop_names"].items()
-    }
+    values = {}
+    for pid, pname in _state["prop_names"].items():
+        try:
+            values[pid] = getattr(scene, pname)
+        except AttributeError:
+            # A property that was registered by an older revision (or removed
+            # with the add-on) must not take the whole poll down.
+            continue
+    return values
 
 
 def _set_params(values: dict, suspend: bool = True) -> None:
@@ -204,6 +445,10 @@ def _set_params(values: dict, suspend: bool = True) -> None:
             setattr(scene, pname, float(values[pid]))
     if suspend:
         _state["suspending"] = False
+    # Programmatic writes (pack load, presets, randomize, group ops) go to the
+    # Scene; push them to the widget host so the panel shows them immediately.
+    _push_to_host()
+    _sync_param_snapshot()
 
 
 # --------------------------------------------------------------------------
@@ -434,6 +679,32 @@ def _target_scene(context):
     return context.scene
 
 
+def _shading_types() -> set:
+    """Shading mode of every open 3D viewport ("SOLID", "MATERIAL", ...)."""
+    modes = set()
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type != "VIEW_3D":
+                    continue
+                for space in area.spaces:
+                    if space.type == "VIEW_3D":
+                        modes.add(space.shading.type)
+    except Exception:
+        pass
+    return modes
+
+
+def _heavy_shading() -> bool:
+    """True while a material-preview / rendered viewport is open.
+
+    Refreshing the armature rest needs an Edit-mode round trip, and EEVEE then
+    re-evaluates every visible skinned mesh: measured 1.24 s per call with the
+    VRM MToon materials against 16 ms in Solid/Wireframe (docs/vroid.md 7.4).
+    """
+    return bool(_shading_types() & {"MATERIAL", "RENDERED"})
+
+
 def _ensure_armature(context, world, joints: list, parents: list, kept: list):
     """Build or refresh the armature that mirrors the runtime skeleton."""
     arm_obj = bpy.data.objects.get(_RIG_NAME)
@@ -545,9 +816,17 @@ def _bind_object(obj, arm_obj, enabled: bool) -> None:
     modifier = obj.modifiers.get(_RIG_MODIFIER)
     if modifier is None:
         modifier = obj.modifiers.new(_RIG_MODIFIER, "ARMATURE")
-    modifier.object = arm_obj
-    modifier.show_viewport = enabled
-    modifier.show_render = enabled
+    # Only write what actually differs: re-assigning the modifier object (or
+    # its flags) tags the modifier stack, which makes EEVEE treat the mesh as
+    # structurally changed and re-bake its probes/shadows.  Measured ~200 ms
+    # per slider step with the VRM MToon materials (see docs/vroid.md 7.4).
+    if modifier.object is not arm_obj:
+        modifier.object = arm_obj
+    enabled = bool(enabled)
+    if modifier.show_viewport != enabled:
+        modifier.show_viewport = enabled
+    if modifier.show_render != enabled:
+        modifier.show_render = enabled
     if obj.parent is not arm_obj:
         obj.parent = arm_obj
         obj.matrix_parent_inverse = Matrix.Identity(4)
@@ -580,6 +859,10 @@ def _prepare_mesh_data(pack) -> None:
 
 
 def _evaluate_mesh(context) -> tuple[bool, str]:
+    return _evaluate_mesh_impl(context, live=False)
+
+
+def _evaluate_mesh_impl(context, live: bool) -> tuple[bool, str]:
     if _state["adapter"] is None:
         return False, "load a template pack first"
     params = _collect_params()
@@ -593,7 +876,7 @@ def _evaluate_mesh(context) -> tuple[bool, str]:
     except Exception as exc:
         return False, str(exc)
     try:
-        _update_mesh(context, result)
+        _update_mesh(context, result, live=live)
     except Exception as exc:
         import traceback
         traceback.print_exc()
@@ -603,8 +886,29 @@ def _evaluate_mesh(context) -> tuple[bool, str]:
     return True, "ok"
 
 
-def _update_mesh(context, result) -> bpy.types.Object | None:
-    use_rig = bool(getattr(context.scene, "pd_use_rig", True))
+def _face_list(faces) -> list[tuple[int, ...]]:
+    """Python face tuples, only built when a mesh really has to be rebuilt."""
+    return [tuple(int(idx) for idx in f) for f in faces]
+
+
+def _write_vertices(mesh, coords: np.ndarray) -> None:
+    """Copy vertex positions in one buffer write (no Python list round trip).
+
+    ``foreach_set`` accepts the numpy buffer directly; going through
+    ``tolist()`` cost ~30 ms per slider step on the 17k-triangle packs and
+    showed up as lag whenever the viewport had to keep up.
+    """
+    mesh.vertices.foreach_set("co", coords.ravel())
+
+
+def _coords_equal(cached, coords: np.ndarray) -> bool:
+    """True when a mesh already holds exactly these vertex positions."""
+    return (cached is not None and cached.shape == coords.shape
+            and np.array_equal(cached, coords))
+
+
+def _update_mesh(context, result, live: bool = False) -> bpy.types.Object | None:
+    use_rig = bool(_flag("pd_use_rig", context))
     extra = getattr(result, "extra", None) or {}
     world = extra.get("world")
     joints = list(extra.get("joints") or [])
@@ -612,27 +916,36 @@ def _update_mesh(context, result) -> bpy.types.Object | None:
     sign = len(joints)
     arm_obj = None
     if world is not None and joints:
-        if (_rig_changed(world, joints) or _state.get("rig_sign") != sign
-                or bpy.data.objects.get(_RIG_NAME) is None):
+        rig_obj = bpy.data.objects.get(_RIG_NAME)
+        needs_rig = (_rig_changed(world, joints) or _state.get("rig_sign") != sign
+                     or rig_obj is None)
+        # Defer only the *rest refresh* of an existing rig, and only while a
+        # material preview is open: the first build and every explicit evaluate
+        # stay immediate.
+        if (needs_rig and live and rig_obj is not None
+                and _state.get("rig_sign") == sign and _heavy_shading()):
+            _state["rig_stale"] = True
+            arm_obj = rig_obj
+            needs_rig = False
+        if needs_rig:
             kept, remap = _rig_subset(joints, parents)
             if _state.get("rig_sign") != sign:
                 _state["rig_regroup"] = True
             arm_obj = _ensure_armature(context, world, joints, parents, kept)
             _state["rig_remap"] = remap
             _state["rig_sign"] = sign
+            _state["rig_joints"] = joints
+            _state["rig_world"] = np.array(world, dtype=np.float64)
+            _state["rig_stale"] = False
         else:
-            arm_obj = bpy.data.objects.get(_RIG_NAME)
-        _state["rig_joints"] = joints
-        _state["rig_world"] = np.array(world, dtype=np.float64)
+            arm_obj = rig_obj
 
     regroup = _state.get("rig_regroup", False)
     _state["rig_regroup"] = False
     first = None
     for i, (name, verts, faces, uvs) in enumerate(result.meshes):
         obj_name = "PD_Avatar" if i == 0 else f"PD_Avatar_{name}"
-        verts = np.asarray(verts, dtype=np.float64)
-        flat_verts = verts.ravel().tolist()
-        face_list = [tuple(int(idx) for idx in f) for f in faces]
+        coords = np.ascontiguousarray(verts, dtype=np.float32)
         obj = bpy.data.objects.get(obj_name)
         if obj is not None and obj.name not in context.scene.objects:
             # The datablock survived but is not linked to this scene (deleted
@@ -642,21 +955,27 @@ def _update_mesh(context, result) -> bpy.types.Object | None:
         rebuilt = False
         if obj is None:
             mesh = bpy.data.meshes.new(name)
-            mesh.from_pydata(verts.tolist(), [], face_list)
+            mesh.from_pydata(coords.tolist(), [], _face_list(faces))
             mesh.update()
             obj = bpy.data.objects.new(obj_name, mesh)
             context.scene.collection.objects.link(obj)
             rebuilt = True
         else:
             mesh = obj.data
-            if (len(mesh.vertices) != len(verts)
-                    or len(mesh.polygons) != len(face_list)):
+            if (len(mesh.vertices) != len(coords)
+                    or len(mesh.polygons) != len(faces)):
                 mesh.clear_geometry()
-                mesh.from_pydata(verts.tolist(), [], face_list)
+                mesh.from_pydata(coords.tolist(), [], _face_list(faces))
+                mesh.update()
                 rebuilt = True
-            else:
-                mesh.vertices.foreach_set("co", flat_verts)
-            mesh.update()
+            elif not _coords_equal(_state["written"].get(obj_name), coords):
+                # Only touch meshes whose vertices really changed: rewriting a
+                # mesh (or even calling Mesh.update on it) makes EEVEE
+                # re-evaluate it, and with the VRM materials that costs ~7 ms
+                # per mesh plus ~5 ms for its outline modifier.
+                _write_vertices(mesh, coords)
+                mesh.update()
+        _state["written"][obj_name] = coords
         if rebuilt:
             _configure_mesh(obj, name, uvs)
         if rebuilt or regroup:
@@ -678,7 +997,7 @@ class PD_OT_load_pack(Operator):
     pack_path: StringProperty(name="Pack Path", subtype="FILE_PATH", default="")
 
     def execute(self, context):
-        path = self.pack_path or context.scene.pd_pack_path
+        path = self.pack_path or _flag("pd_pack_path", context)
         issues = validate_pack(path)
         if issues:
             self.report({"ERROR"}, "; ".join(issues[:3]))
@@ -689,6 +1008,7 @@ class PD_OT_load_pack(Operator):
         _state.update(pack=pack, adapter=adapter)
         _prepare_mesh_data(pack)
         _register_params(pack.params)
+        _start_param_poll()
         self.report(
             {"INFO"},
             f"loaded {pack.manifest['name']} ({len(pack.params)} params)",
@@ -756,6 +1076,8 @@ def _finish_evaluate(operator, context) -> set:
     if not ok:
         operator.report({"ERROR"}, message)
         return {"CANCELLED"}
+    # The values this evaluation used are now the reference for the poll.
+    _sync_param_snapshot()
     return {"FINISHED"}
 
 
@@ -817,6 +1139,36 @@ class PD_OT_zero_group(Operator):
         return _finish_evaluate(self, context)
 
 
+class PD_OT_toggle_outline(Operator):
+    bl_idname = "pd.toggle_outline"
+    bl_label = "Toggle Viewport Outline"
+    bl_description = (
+        "Enable or disable the outline Geometry Nodes modifiers in the "
+        "viewport. They re-evaluate on every slider step, which is a large "
+        "part of the material-mode lag; rendering is unaffected"
+    )
+
+    def execute(self, context):
+        modifiers = [
+            mod
+            for obj in bpy.data.objects
+            if obj.type == "MESH" and obj.name.startswith("PD_Avatar")
+            for mod in obj.modifiers
+            if mod.type == "NODES"
+        ]
+        if not modifiers:
+            self.report({"INFO"}, "no outline modifiers on the avatar")
+            return {"CANCELLED"}
+        enable = not any(mod.show_viewport for mod in modifiers)
+        for mod in modifiers:
+            mod.show_viewport = enable
+        _state["outline_viewport"] = enable
+        self.report({"INFO"},
+                    f"viewport outline {'on' if enable else 'off'} "
+                    f"({len(modifiers)} modifiers)")
+        return {"FINISHED"}
+
+
 class PD_OT_save_preset(Operator):
     bl_idname = "pd.save_preset"
     bl_label = "Save Preset"
@@ -875,26 +1227,33 @@ class PD_PT_main(Panel):
     def draw(self, context):
         layout = self.layout
         col = layout.column()
-        col.prop(context.scene, "pd_pack_path")
+        # Bind every widget to the collection, never to the Scene: see _host.
+        host = _host(context)
+        # Self-heal: the panel is drawn from a real UI context, so if the poll
+        # timer died (an exception, a stale revision) bring it back here —
+        # otherwise slider changes would silently stop updating the mesh.
+        if _state.get("pack") is not None:
+            _start_param_poll()
+        col.prop(host, "pd_pack_path")
         col.operator("pd.load_pack", text="Load Pack").pack_path = (
-            context.scene.pd_pack_path
+            host.pd_pack_path
         )
         if _state["pack"] is None:
             return
         col.separator()
-        col.prop(context.scene, "pd_preset_name")
+        col.prop(host, "pd_preset_name")
         row = col.row(align=True)
         row.operator("pd.save_preset", text="Save").preset_name = (
-            context.scene.pd_preset_name
+            host.pd_preset_name
         )
         row.operator("pd.load_preset", text="Load").preset_name = (
-            context.scene.pd_preset_name
+            host.pd_preset_name
         )
         row.operator("pd.delete_preset", text="Delete").preset_name = (
-            context.scene.pd_preset_name
+            host.pd_preset_name
         )
-        col.prop(context.scene, "pd_live_update", text="Live Update")
-        col.prop(context.scene, "pd_use_rig", text="Deform With Bones")
+        col.prop(host, "pd_live_update", text="Live Update")
+        col.prop(host, "pd_use_rig", text="Deform With Bones")
         if _state.get("last_error"):
             box = col.box()
             box.label(text="Last error:", icon="ERROR")
@@ -904,6 +1263,25 @@ class PD_PT_main(Panel):
             col.label(
                 text=f"Rig: {len(rig.data.bones)} bones (VRoid humanoid set)"
             )
+            if _state.get("rig_stale"):
+                col.label(
+                    text="Rig rest updates in Solid mode or on Evaluate",
+                    icon="INFO",
+                )
+        outline_mods = [
+            mod
+            for obj in bpy.data.objects
+            if obj.type == "MESH" and obj.name.startswith("PD_Avatar")
+            for mod in obj.modifiers
+            if mod.type == "NODES"
+        ]
+        if outline_mods:
+            shown = any(mod.show_viewport for mod in outline_mods)
+            col.operator(
+                "pd.toggle_outline",
+                text=f"Viewport Outline: {'On' if shown else 'Off'}",
+                icon="HIDE_OFF" if shown else "HIDE_ON",
+            )
         col.operator("pd.evaluate", text="Evaluate / Update Mesh")
         for action in _state["pack"].actions:
             col.operator(
@@ -911,10 +1289,10 @@ class PD_PT_main(Panel):
             ).action_id = action.get("id", "")
         col.operator("pd.randomize", text="Randomize")
         col.separator()
-        col.prop(context.scene, "pd_filter", text="Filter (regex)")
+        col.prop(host, "pd_filter", text="Filter (regex)")
 
         pattern = None
-        filter_text = context.scene.pd_filter.strip()
+        filter_text = host.pd_filter.strip()
         if filter_text:
             try:
                 pattern = re.compile(filter_text, re.IGNORECASE)
@@ -925,10 +1303,10 @@ class PD_PT_main(Panel):
             show_prop = _state["group_props"].get(group)
             if not show_prop:
                 continue
-            expanded = getattr(context.scene, show_prop)
+            expanded = getattr(host, show_prop)
             header = box.row()
             header.prop(
-                context.scene,
+                host,
                 show_prop,
                 text=group,
                 icon="TRIA_DOWN" if expanded else "TRIA_RIGHT",
@@ -955,7 +1333,7 @@ class PD_PT_main(Panel):
                     subgroup_drawn = True
                 pname = _state["prop_names"].get(p["id"])
                 if pname:
-                    box.prop(context.scene, pname)
+                    box.prop(host, pname)
 
 
 CLASSES = (
@@ -965,6 +1343,7 @@ CLASSES = (
     PD_OT_randomize,
     PD_OT_randomize_group,
     PD_OT_zero_group,
+    PD_OT_toggle_outline,
     PD_OT_save_preset,
     PD_OT_load_preset,
     PD_OT_delete_preset,
