@@ -61,6 +61,16 @@ def main() -> int:
     assert bpy.ops.pd.load_pack(pack_path=pack_dir) == {"FINISHED"}
     assert bpy.ops.pd.evaluate() == {"FINISHED"}
 
+    # This check is written against an avatar-style pack: it needs a slider that
+    # really moves a separate body mesh.  Skip cleanly for anything else so the
+    # same command can run against every pack in CI.
+    if ("Arm Length" not in _state["prop_names"]
+            or bpy.data.objects.get("PD_Avatar_body") is None):
+        print("OPERATOR CHECK SKIP pack has no 'Arm Length' slider / body mesh")
+        parametric_deformation.unregister()
+        bpy.ops.wm.quit_blender()
+        return 0
+
     failures: list = []
     groups = sorted({p.get("group", "Params") for p in _state["params"]})
 

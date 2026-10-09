@@ -1,0 +1,33 @@
+# Blender extension manifest (Blender 4.2+).
+#
+# With this file present, the package can be dropped into an extension
+# directory and enabled from Preferences > Add-ons > Extensions:
+#
+#   <extensions>/user_default/parametric_deformation/blender_manifest.toml
+#   <extensions>/user_default/parametric_deformation/__init__.py
+#
+# An installed extension is imported as ``bl_ext.<repo>.parametric_deformation``
+# (not ``parametric_deformation``), which is why every runtime import inside the
+# package is relative.
+schema_version = "1.0.0"
+
+id = "parametric_deformation"
+name = "Parametric Deformation"
+tagline = "Template-pack driven parametric deformation for avatars"
+type = "add-on"
+version = "0.1.0"
+
+blender_version_min = "4.5.0"
+maintainer = "cyber_persona project"
+# Matches the license Blender's own extension template writes
+# (bl_pkg/cli/blender_ext.py) and the GPL-2.0-or-later text in LICENSE.
+license = ["SPDX:GPL-2.0-or-later"]
+
+[permissions]
+files = "Read template packs and write slider presets"
+
+[build]
+paths_exclude_pattern = [
+    "__pycache__/",
+    ".*",
+]

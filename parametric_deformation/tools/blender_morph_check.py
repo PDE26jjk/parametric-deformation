@@ -60,6 +60,12 @@ def main() -> int:
     assert bpy.ops.pd.load_pack(pack_path=pack_dir) == {"FINISHED"}
     assert bpy.ops.pd.evaluate() == {"FINISHED"}
 
+    if not os.path.exists(os.path.join(pack_dir, "data", "morph_sliders.json")):
+        print("MORPH CHECK SKIP pack has no data/morph_sliders.json")
+        parametric_deformation.unregister()
+        bpy.ops.wm.quit_blender()
+        return 0
+
     with open(os.path.join(pack_dir, "data", "morph_sliders.json"),
               encoding="utf-8") as fh:
         table = json.load(fh)

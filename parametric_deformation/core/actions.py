@@ -73,6 +73,32 @@ def _vrm_operator_ready() -> bool:
     return True
 
 
+#: The VRM importer is a thin wrapper around the bundled glTF importer, so a
+#: disabled glTF add-on makes ``bpy.ops.import_scene.vrm`` fail *inside* the
+#: VRM add-on with "Calling operator bpy.ops.import_scene.gltf error, could not
+#: be found" - which reads like a VRM problem but is not.
+GLTF_ADDON_MODULE = "io_scene_gltf2"
+
+
+def _gltf_operator_ready() -> bool:
+    try:
+        bpy.ops.import_scene.gltf.get_rna_type()
+    except (AttributeError, KeyError, RuntimeError):
+        return False
+    return True
+
+
+def _ensure_gltf_addon() -> str:
+    """Make sure the glTF importer the VRM add-on delegates to is enabled."""
+    if _gltf_operator_ready():
+        return "ok"
+    try:
+        bpy.ops.preferences.addon_enable(module=GLTF_ADDON_MODULE)
+    except Exception as exc:  # noqa: BLE001
+        return f"failed ({type(exc).__name__}: {exc})"
+    return "enabled" if _gltf_operator_ready() else "unavailable"
+
+
 def _enable_vrm_addon() -> str | None:
     """Try to enable the VRM add-on; returns its module name or None."""
     if _vrm_operator_ready():
@@ -109,18 +135,113 @@ def _copy_outline_modifiers(source, target) -> int:
             continue
         new = target.modifiers.new(modifier.name, "NODES")
         new.node_group = modifier.node_group
-        # Geometry Nodes settings live in the modifier's socket properties.
-        # Sockets that point at the (temporary) source object must be rebound
-        # to the mesh we keep, otherwise they go null when the import is
-        # deleted and the outline disappears.
-        for key in modifier.keys():
-            try:
-                value = modifier[key]
-                new[key] = target if value is source else value
-            except Exception:
-                pass
+        _copy_modifier_socket_values(modifier, new, source, target)
         copied += 1
     return copied
+
+
+def _copy_modifier_socket_values(
+        source_modifier, target_modifier, source_object, target_object) -> int:
+    """Copy Geometry Nodes socket values, rebinding the source object.
+
+    Sockets that point at the (temporary) source object must be rebound to the
+    mesh we keep, otherwise they go null when the import is deleted and the
+    outline disappears.
+
+    Blender < 5.2 keeps these values as (system) ID properties on the modifier
+    (``modifier["Socket_2"]``). Blender 5.2 moved them to runtime RNA exposed
+    as ``modifier.properties.inputs``, where the ID property API raises
+    "this type doesn't support IDProperties", so both routes are tried.
+    """
+    copied = 0
+    try:
+        items = list(source_modifier.items())
+    except TypeError:
+        items = []
+    if items:
+        for key, value in items:
+            try:
+                target_modifier[key] = (
+                    target_object if value is source_object else value)
+                copied += 1
+            except Exception:
+                pass
+        return copied
+
+    source_inputs = getattr(
+        getattr(source_modifier, "properties", None), "inputs", None)
+    target_inputs = getattr(
+        getattr(target_modifier, "properties", None), "inputs", None)
+    if source_inputs is None or target_inputs is None:
+        return copied
+    try:
+        keys = list(source_inputs.keys())
+    except Exception:
+        return copied
+    for key in keys:
+        source_socket = getattr(source_inputs, key, None)
+        target_socket = getattr(target_inputs, key, None)
+        if source_socket is None or target_socket is None:
+            continue
+        # The modifier's interface sockets are read through runtime RNA:
+        # `type` selects value/attribute, `value` holds the setting itself.
+        for attr in ("type", "attribute_name", "value"):
+            if not (hasattr(source_socket, attr) and hasattr(target_socket, attr)):
+                continue
+            try:
+                value = getattr(source_socket, attr)
+                setattr(target_socket, attr,
+                        target_object if value is source_object else value)
+                copied += 1
+            except Exception:
+                pass
+    return copied
+
+
+def rebind_object_sockets(obj, source, target) -> int:
+    """Point Geometry Nodes object sockets that reference ``source`` at ``target``.
+
+    Copying an object carries its modifiers along, but a socket that holds the
+    original object keeps using it - the VRM add-on's outline modifier stores
+    exactly that. Returns the number of sockets that were repointed.
+    """
+    fixed = 0
+    for modifier in obj.modifiers:
+        if modifier.type != "NODES":
+            continue
+        try:
+            items = list(modifier.items())
+        except TypeError:
+            items = []
+        for key, value in items:
+            if value is source:
+                try:
+                    modifier[key] = target
+                    fixed += 1
+                except Exception:
+                    pass
+        if items:
+            continue
+        # Blender 5.2 exposes the same values as runtime RNA instead of ID
+        # properties (see _copy_modifier_socket_values).
+        inputs = getattr(getattr(modifier, "properties", None), "inputs", None)
+        if inputs is None:
+            continue
+        try:
+            keys = list(inputs.keys())
+        except Exception:
+            continue
+        for key in keys:
+            socket = getattr(inputs, key, None)
+            if socket is None:
+                continue
+            try:
+                if getattr(socket, "value", None) is source:
+                    socket.value = target
+                    fixed += 1
+            except Exception:
+                pass
+    return fixed
 
 
 def _resolve_vrm_path(pack, action: dict) -> str:
@@ -153,6 +274,13 @@ def import_vrm_materials(pack, action: dict, ctx: dict) -> str:
         raise RuntimeError(
             "VRM format add-on not available; enable it in "
             "Edit > Preferences > Add-ons (extension 'VRM format' by lunapark)"
+        )
+    gltf = _ensure_gltf_addon()
+    if gltf == "unavailable":
+        raise RuntimeError(
+            "the VRM add-on needs the glTF importer, but "
+            "'Import-Export: glTF 2.0 format' could not be enabled "
+            "(Edit > Preferences > Add-ons)"
         )
 
     before_objects = set(bpy.data.objects)
@@ -229,7 +357,8 @@ def import_vrm_materials(pack, action: dict, ctx: dict) -> str:
     return (f"{len(imported)} VRM materials on {assigned} slots, "
             f"{outlines} outline modifiers "
             f"({packed}/{len(images)} images packed)"
-            + ("" if enabled == "already enabled" else f", enabled {enabled}"))
+            + ("" if enabled == "already enabled" else f", enabled {enabled}")
+            + ("" if gltf in ("ok", "enabled") else f", glTF {gltf}"))
 
 
 register_action("import_vrm_materials", import_vrm_materials)

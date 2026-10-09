@@ -2,6 +2,32 @@
 
 from __future__ import annotations
 
+#: Installed as an extension this package is imported as
+#: ``bl_ext.<repo>.parametric_deformation``, while every template pack's
+#: ``py/driver.py`` (and scripts written before the extension existed) imports
+#: ``parametric_deformation...``.  The helper below publishes the classic name
+#: for the *same* module objects, so a pack never gets a second copy of the
+#: package - two copies would break the ``TemplateAdapter`` isinstance() check
+#: in ``tools.load_driver()``.
+_ALIAS_ROOT = "parametric_deformation"
+
+
+def _publish_package_alias() -> None:
+    """Register every loaded submodule under the classic package name.
+
+    Called once the package is fully imported (``register()``) and again right
+    before a template driver is imported, because that driver is written
+    against the classic name.
+    """
+    import sys
+
+    if __name__ == _ALIAS_ROOT:  # legacy add-on install: nothing to alias
+        return
+    for name, module in list(sys.modules.items()):
+        if name == __name__ or name.startswith(__name__ + "."):
+            sys.modules.setdefault(_ALIAS_ROOT + name[len(__name__):], module)
+
+
 bl_info = {
     "name": "参数化变形 (Parametric Deformation)",
     "author": "cyber_persona project",
@@ -18,7 +44,14 @@ def register() -> None:
     import bpy
     from bpy.props import BoolProperty, StringProperty
 
-    from .ui.panels import CLASSES, _host_updated
+    from .ui.panels import (
+        CLASSES,
+        _host_updated,
+        _pack_path_updated,
+        _preset_path_updated,
+    )
+
+    _publish_package_alias()
 
     # The widget-facing copies of these flags live on the *collection* the panel
     # binds to (see panels._host), because a Scene-owned property tags the whole
@@ -30,6 +63,8 @@ def register() -> None:
         ("pd_pack_path", StringProperty,
          {"name": "Pack Path", "subtype": "FILE_PATH", "default": ""}),
         ("pd_preset_name", StringProperty, {"name": "Preset", "default": "preset"}),
+        ("pd_preset_path", StringProperty,
+         {"name": "Preset Path", "subtype": "FILE_PATH", "default": ""}),
         ("pd_live_update", BoolProperty, {"name": "Live Update", "default": True}),
         ("pd_use_rig", BoolProperty,
          {"name": "Deform With Bones",
@@ -40,12 +75,19 @@ def register() -> None:
          {"name": "Filter", "description": "Regex filter for sliders",
           "default": ""}),
     )
+    # Pack Path and Preset Path load themselves as soon as the path is usable,
+    # so they get their own callback instead of the generic "arm the settle
+    # timer" one.
+    host_callbacks = {
+        "pd_pack_path": _pack_path_updated,
+        "pd_preset_path": _preset_path_updated,
+    }
     for name, ctor, kwargs in flags:
         for cls in (bpy.types.Scene, bpy.types.Collection):
             if hasattr(cls, name):
                 delattr(cls, name)
         setattr(bpy.types.Scene, name, ctor(**kwargs))
-        host_kwargs = dict(kwargs, update=_host_updated)
+        host_kwargs = dict(kwargs, update=host_callbacks.get(name, _host_updated))
         setattr(bpy.types.Collection, name, ctor(**host_kwargs))
     for cls in CLASSES:
         bpy.utils.register_class(cls)
@@ -77,8 +119,8 @@ def unregister() -> None:
             delattr(bpy.types.Scene, pname)
         if hasattr(bpy.types.Collection, pname):
             delattr(bpy.types.Collection, pname)
-    for pname in ("pd_pack_path", "pd_preset_name", "pd_live_update",
-                  "pd_use_rig", "pd_filter"):
+    for pname in ("pd_pack_path", "pd_preset_name", "pd_preset_path",
+                  "pd_live_update", "pd_use_rig", "pd_filter"):
         if hasattr(bpy.types.Scene, pname):
             delattr(bpy.types.Scene, pname)
         if hasattr(bpy.types.Collection, pname):

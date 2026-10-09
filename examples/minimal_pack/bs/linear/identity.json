@@ -1,0 +1,7 @@
+{
+ "id": "identity",
+ "type": "linear",
+ "data": {
+  "file": "data/identity.npy"
+ }
+}

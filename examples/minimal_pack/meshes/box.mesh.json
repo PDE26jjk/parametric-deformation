@@ -1,0 +1,9 @@
+{
+ "name": "box",
+ "vertices": {
+  "file": "data/vertices.npy"
+ },
+ "faces": {
+  "file": "data/faces.npy"
+ }
+}

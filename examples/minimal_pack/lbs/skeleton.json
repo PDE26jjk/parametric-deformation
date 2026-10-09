@@ -1,0 +1,19 @@
+{
+ "joints": [
+  {
+   "id": "Root",
+   "parent": 0
+  },
+  {
+   "id": "Top",
+   "parent": 0
+  }
+ ],
+ "parent_indices": [
+  0,
+  0
+ ],
+ "positions": {
+  "file": "data/joints.npy"
+ }
+}

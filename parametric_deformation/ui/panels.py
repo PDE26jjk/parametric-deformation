@@ -14,16 +14,21 @@ from bpy.props import BoolProperty, FloatProperty, StringProperty
 from bpy.types import Operator, Panel
 from mathutils import Matrix, Vector
 
-from parametric_deformation.core.config import (
+# Relative imports: an extension install imports this package as
+# ``bl_ext.<repo>.parametric_deformation``, so the absolute package name is not
+# available at runtime (docs/vroid.md 7.5).
+from ..core.config import (
     load_data_array,
     load_pack,
     validate_pack,
 )
-from parametric_deformation.core import actions as pd_actions
-from parametric_deformation.tools import load_driver
+from ..core import actions as pd_actions
+from ..tools import load_driver
 
 _state = {
     "pack": None,
+    "pack_path": None,     # absolute path of the loaded pack
+    "preset_path": None,   # absolute path of the loaded/saved preset file
     "adapter": None,
     "params": [],
     "prop_names": {},      # param id -> Scene property name
@@ -56,6 +61,16 @@ _AXIS_TO_BLENDER = np.array(
 
 _RIG_NAME = "PD_Rig"
 _RIG_MODIFIER = "PD_Rig"
+
+#: How long to wait after the last Pack Path write before loading it.  The
+#: file browser writes the property once when the user accepts, but typing in
+#: the text field writes it per keystroke, so the load runs on a short timer
+#: that coalesces those writes into one attempt.
+_PACK_AUTOLOAD_SECONDS = 0.15
+
+#: Object name prefix of everything the detach button produces.
+_DETACH_PREFIX = "Detached"
+
 #: Bumped whenever the viewport update path changes, so the panel can show
 #: which build is actually loaded (a stale add-on reload looks like "the fix
 #: did nothing").
@@ -149,8 +164,8 @@ _SETTLE_SECONDS = 0.01
 #: 11-13 ms, always exists, is saved with the .blend and is invisible in the UI,
 #: so the panel binds there and the Scene property is kept as a mirror for
 #: scripts, tools and files saved by older revisions.
-_FLAG_PROPS = ("pd_pack_path", "pd_preset_name", "pd_live_update", "pd_use_rig",
-               "pd_filter")
+_FLAG_PROPS = ("pd_pack_path", "pd_preset_name", "pd_preset_path",
+               "pd_live_update", "pd_use_rig", "pd_filter")
 
 
 def _host(context=None):
@@ -179,6 +194,148 @@ def _host_updated(_self, _context) -> None:
     for scripts that write the Scene mirror directly).
     """
     _schedule_flush()
+
+
+def _pack_path_updated(_self, _context) -> None:
+    """RNA ``update`` callback of the Pack Path widget.
+
+    Accepting a folder in the file browser writes the property once, and the
+    user expects the pack to load right there; typing writes it per keystroke,
+    which must not spam validation errors.  So this only arms a short timer and
+    the timer decides whether the path is loadable yet.
+    """
+    if _state["suspending"]:
+        return
+    if not bpy.app.timers.is_registered(_auto_load_pack):
+        bpy.app.timers.register(
+            _auto_load_pack, first_interval=_PACK_AUTOLOAD_SECONDS
+        )
+
+
+def _auto_load_pack():
+    """Load whatever the Pack Path widget points at, once it looks complete."""
+    try:
+        # Read the widget owner directly.  Going through ``_flag`` would run
+        # _sync_host first, and its "the Scene copy wins on first sight" rule
+        # (there for .blend files written by older revisions) would drop a path
+        # the user just picked, because the Scene mirror is still empty.
+        path = getattr(_host(), "pd_pack_path", "")
+        if not path:
+            return None
+        path = os.path.abspath(bpy.path.abspath(path))
+        # Keep the mirror in step before anything reconciles the pair, or the
+        # next _push_to_host would copy the empty Scene value back over it.
+        try:
+            bpy.context.scene.pd_pack_path = path
+        except Exception:
+            pass
+        if path == _state.get("pack_path"):
+            return None
+        # A half-typed path is normal while the user edits the text field, so
+        # an unusable path stays silent until the timer sees a complete one.
+        if not os.path.exists(path):
+            return None
+        ok, message = _load_pack_path(path)
+        if not ok:
+            _state["last_error"] = message
+    except Exception as exc:  # never let the timer die on a pack problem
+        _state["last_error"] = f"{type(exc).__name__}: {exc}"
+    return None
+
+
+def _load_pack_path(path: str) -> tuple[bool, str]:
+    """Validate and install a template pack; shared by the button and the
+    automatic load triggered by the Pack Path widget."""
+    issues = validate_pack(path)
+    if issues:
+        return False, "; ".join(issues[:3])
+    pack = load_pack(path)
+    adapter = load_driver(path)
+    adapter.load(pack, path)
+    _state.update(pack=pack, adapter=adapter,
+                  pack_path=os.path.abspath(path))
+    _prepare_mesh_data(pack)
+    _register_params(pack.params)
+    _start_param_poll()
+    return True, f"loaded {pack.manifest['name']} ({len(pack.params)} params)"
+
+
+def _resolve_preset_path(value: str) -> str:
+    """Absolute preset file path for a widget value.
+
+    An empty value falls back to ``presets/preset.json``; a bare file name is
+    taken relative to the presets directory, and a missing ``.json`` is added,
+    so both "my look" and "D:/looks/hero.json" mean something sensible.
+    """
+    value = (value or "").strip()
+    if not value:
+        value = "preset"
+    if not os.path.isabs(value):
+        value = os.path.join(_preset_dir(), value)
+    if not value.lower().endswith(".json"):
+        value += ".json"
+    return os.path.abspath(value)
+
+
+def _preset_path_updated(_self, _context) -> None:
+    """RNA ``update`` callback of the Preset Path widget (same idea as Pack Path)."""
+    if _state["suspending"]:
+        return
+    if not bpy.app.timers.is_registered(_auto_load_preset):
+        bpy.app.timers.register(
+            _auto_load_preset, first_interval=_PACK_AUTOLOAD_SECONDS
+        )
+
+
+def _auto_load_preset():
+    """Load whatever preset file the Preset Path widget points at."""
+    try:
+        value = getattr(_host(), "pd_preset_path", "")
+        if not value:
+            return None
+        path = _resolve_preset_path(value)
+        try:
+            bpy.context.scene.pd_preset_path = path
+        except Exception:
+            pass
+        if path == _state.get("preset_path"):
+            return None
+        if not os.path.exists(path):
+            return None
+        ok, message = _load_preset_file(path)
+        if not ok:
+            _state["last_error"] = message
+    except Exception as exc:  # never let the timer die on a preset problem
+        _state["last_error"] = f"{type(exc).__name__}: {exc}"
+    return None
+
+
+def _load_preset_file(path: str) -> tuple[bool, str]:
+    """Read a preset file into the sliders (shared by button and auto load)."""
+    if not os.path.exists(path):
+        return False, f"preset not found: {path}"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            values = json.load(fh)
+    except Exception as exc:
+        return False, f"cannot read {path}: {exc}"
+    _set_params(values)
+    _state["preset_path"] = os.path.abspath(path)
+    # The slider poll compares against its snapshot, so the values written here
+    # must stay "new" to it - that is what makes the auto-loaded preset show up
+    # in the viewport.  The Load button evaluates explicitly and re-baselines
+    # the snapshot itself.
+    return True, f"preset loaded from {path}"
+
+
+def _preset_target(operator_path: str, operator_name: str) -> str:
+    """Where a preset button reads or writes.
+
+    The panel passes the Preset Path widget value in, scripts pass either a path
+    or a bare name (which resolves under the presets directory), and an empty
+    value means ``presets/preset.json``.
+    """
+    return _resolve_preset_path(operator_path or operator_name)
 
 
 def _schedule_flush() -> None:
@@ -990,6 +1147,151 @@ def _update_mesh(context, result, live: bool = False) -> bpy.types.Object | None
     return first
 
 
+def _avatar_object(index: int, mesh_name: str):
+    """The add-on-owned object for one mesh of the evaluated result."""
+    name = "PD_Avatar" if index == 0 else f"PD_Avatar_{mesh_name}"
+    return bpy.data.objects.get(name)
+
+
+def _detached_object_name(mesh_name: str) -> str:
+    return f"{_DETACH_PREFIX}_{mesh_name[:1].upper()}{mesh_name[1:]}"
+
+
+def _detach_mesh(context) -> tuple[bool, str]:
+    """Copy the evaluated meshes out of the add-on as independent objects.
+
+    The copies stop being driven by the sliders because every update path looks
+    its objects up by the ``PD_Avatar`` name, and the copies are renamed.  The
+    template may contribute shape keys (VRoid turns its expression sliders into
+    keys) and the rig is copied along, so the result is self-contained.
+    """
+    pack = _state["pack"]
+    adapter = _state["adapter"]
+    if pack is None or adapter is None:
+        return False, "load a template pack first"
+
+    scene = _target_scene(context)
+    if not any(o.name.startswith("PD_Avatar") for o in bpy.data.objects):
+        return False, "press 'Evaluate / Update Mesh' first"
+
+    params = _collect_params()
+    num_joints = len(pack.skeleton.get("joints", []))
+    pose = {
+        "rotations": [[0.0, 0.0, 0.0]] * num_joints,
+        "translation": [0.0, 0.0, 0.0],
+    }
+
+    # The basis is the current model with every shape-keyed slider back at 0;
+    # each key then carries one slider's full travel, exactly like the
+    # blend-shape basis the template evaluates with.
+    shape_keys = list(adapter.detach_shape_keys() or [])
+    basis_params = dict(params)
+    for key in shape_keys:
+        for param_id in (key.get("params") or {}):
+            basis_params[param_id] = 0.0
+    try:
+        basis = adapter.evaluate(basis_params, pose)
+    except Exception as exc:
+        return False, f"basis evaluation failed: {exc}"
+
+    evaluated_keys = []
+    for key in shape_keys:
+        overrides = dict(key.get("params") or {})
+        if not overrides:
+            continue
+        # Start from the basis, not from the current values: every other
+        # shape-keyed parameter has to stay at 0 while this key is measured,
+        # otherwise each key would also carry whichever expressions the user
+        # happens to have active right now - and blending the keys back would
+        # then double-count them (all keys looking like the active expression).
+        values = dict(basis_params)
+        values.update(overrides)
+        try:
+            result = adapter.evaluate(values, pose)
+        except Exception:
+            continue
+        evaluated_keys.append(
+            (key.get("name") or next(iter(overrides)), overrides, result)
+        )
+
+    source_rig = bpy.data.objects.get(_RIG_NAME)
+    rig_copy = None
+    if source_rig is not None and source_rig.type == "ARMATURE":
+        stale = bpy.data.objects.get(f"{_DETACH_PREFIX}_Rig")
+        if stale is not None:
+            bpy.data.objects.remove(stale, do_unlink=True)
+        rig_copy = source_rig.copy()
+        rig_copy.data = source_rig.data.copy()
+        rig_copy.name = f"{_DETACH_PREFIX}_Rig"
+        rig_copy.data.name = rig_copy.name
+        scene.collection.objects.link(rig_copy)
+
+    created = 0
+    keys_added = 0
+    skipped = []
+    for index, (mesh_name, verts, _faces, _uvs) in enumerate(basis.meshes):
+        source = _avatar_object(index, mesh_name)
+        coords = np.ascontiguousarray(verts, dtype=np.float32)
+        if source is None or len(source.data.vertices) != len(coords):
+            skipped.append(mesh_name)
+            continue
+        stale = bpy.data.objects.get(_detached_object_name(mesh_name))
+        if stale is not None:
+            bpy.data.objects.remove(stale, do_unlink=True)
+        obj = source.copy()
+        obj.data = source.data.copy()
+        obj.name = _detached_object_name(mesh_name)
+        obj.data.name = obj.name
+        scene.collection.objects.link(obj)
+        _write_vertices(obj.data, coords)
+        obj.data.update()
+        # Modifiers come across with the copy; outline modifiers keep a socket
+        # that points at the original object and must follow the copy.
+        pd_actions.rebind_object_sockets(obj, source, obj)
+        if rig_copy is not None:
+            modifier = obj.modifiers.get(_RIG_MODIFIER)
+            if modifier is not None:
+                modifier.object = rig_copy
+            if obj.parent is source_rig:
+                obj.parent = rig_copy
+                obj.matrix_parent_inverse = Matrix.Identity(4)
+
+        entries = []
+        for key_name, overrides, result in evaluated_keys:
+            match = next((m for m in result.meshes if m[0] == mesh_name), None)
+            if match is None:
+                continue
+            key_coords = np.ascontiguousarray(match[1], dtype=np.float32)
+            if (key_coords.shape != coords.shape
+                    or np.array_equal(key_coords, coords)):
+                continue
+            param_id = next(iter(overrides))
+            entries.append((key_name, key_coords,
+                            float(params.get(param_id, 0.0) or 0.0)))
+        if entries:
+            obj.shape_key_add(name="Basis", from_mix=False)
+            blocks = obj.data.shape_keys.key_blocks
+            for key_name, key_coords, value in entries:
+                block = obj.shape_key_add(name=key_name, from_mix=False)
+                block.data.foreach_set("co", key_coords.ravel())
+                # shape_key_add() creates the key at value 1.0, so this has to
+                # be written unconditionally - skipping the zero case is what
+                # left every key at 1 instead of following the sliders.
+                block.value = value
+            obj.data.update()
+            keys_added += len(entries)
+        created += 1
+
+    message = f"{created} detached mesh(es)"
+    if keys_added:
+        message += f", {keys_added} shape key(s)"
+    if rig_copy is not None:
+        message += ", rig copied"
+    if skipped:
+        message += f", skipped {', '.join(skipped)}"
+    return True, message
+
+
 class PD_OT_load_pack(Operator):
     bl_idname = "pd.load_pack"
     bl_label = "Load Template Pack"
@@ -998,21 +1300,14 @@ class PD_OT_load_pack(Operator):
 
     def execute(self, context):
         path = self.pack_path or _flag("pd_pack_path", context)
-        issues = validate_pack(path)
-        if issues:
-            self.report({"ERROR"}, "; ".join(issues[:3]))
+        if not path:
+            self.report({"ERROR"}, "set a Pack Path first")
             return {"CANCELLED"}
-        pack = load_pack(path)
-        adapter = load_driver(path)
-        adapter.load(pack, path)
-        _state.update(pack=pack, adapter=adapter)
-        _prepare_mesh_data(pack)
-        _register_params(pack.params)
-        _start_param_poll()
-        self.report(
-            {"INFO"},
-            f"loaded {pack.manifest['name']} ({len(pack.params)} params)",
-        )
+        ok, message = _load_pack_path(path)
+        if not ok:
+            self.report({"ERROR"}, message)
+            return {"CANCELLED"}
+        self.report({"INFO"}, message)
         return {"FINISHED"}
 
 
@@ -1035,6 +1330,19 @@ class PD_OT_evaluate(Operator):
         self.report(
             {"INFO"}, f"{total} verts across PD_Avatar meshes{bones}"
         )
+        return {"FINISHED"}
+
+
+class PD_OT_detach(Operator):
+    bl_idname = "pd.detach"
+    bl_label = "Detach (Separate Mesh)"
+
+    def execute(self, context):
+        ok, message = _detach_mesh(context)
+        if not ok:
+            self.report({"ERROR"}, message)
+            return {"CANCELLED"}
+        self.report({"INFO"}, message)
         return {"FINISHED"}
 
 
@@ -1174,13 +1482,21 @@ class PD_OT_save_preset(Operator):
     bl_label = "Save Preset"
 
     preset_name: StringProperty(name="Preset", default="preset")
+    preset_path: StringProperty(name="Preset Path", subtype="FILE_PATH", default="")
 
     def execute(self, context):
-        preset_dir = _preset_dir()
-        os.makedirs(preset_dir, exist_ok=True)
-        path = os.path.join(preset_dir, f"{self.preset_name}.json")
+        path = _preset_target(self.preset_path, self.preset_name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(_collect_params(), fh, indent=2)
+        # Point the widget at the file that was just written, and treat it as
+        # loaded so the auto-load timer does not re-apply it straight away.
+        _state["preset_path"] = path
+        try:
+            _host(context).pd_preset_path = path
+            context.scene.pd_preset_path = path
+        except Exception:
+            pass
         self.report({"INFO"}, f"preset saved to {path}")
         return {"FINISHED"}
 
@@ -1190,14 +1506,14 @@ class PD_OT_load_preset(Operator):
     bl_label = "Load Preset"
 
     preset_name: StringProperty(name="Preset", default="preset")
+    preset_path: StringProperty(name="Preset Path", subtype="FILE_PATH", default="")
 
     def execute(self, context):
-        path = os.path.join(_preset_dir(), f"{self.preset_name}.json")
-        if not os.path.exists(path):
-            self.report({"ERROR"}, f"preset not found: {path}")
+        path = _preset_target(self.preset_path, self.preset_name)
+        ok, message = _load_preset_file(path)
+        if not ok:
+            self.report({"ERROR"}, message)
             return {"CANCELLED"}
-        with open(path, "r", encoding="utf-8") as fh:
-            _set_params(json.load(fh))
         return _finish_evaluate(self, context)
 
 
@@ -1206,9 +1522,10 @@ class PD_OT_delete_preset(Operator):
     bl_label = "Delete Preset"
 
     preset_name: StringProperty(name="Preset", default="preset")
+    preset_path: StringProperty(name="Preset Path", subtype="FILE_PATH", default="")
 
     def execute(self, context):
-        path = os.path.join(_preset_dir(), f"{self.preset_name}.json")
+        path = _preset_target(self.preset_path, self.preset_name)
         if not os.path.exists(path):
             self.report({"ERROR"}, f"preset not found: {path}")
             return {"CANCELLED"}
@@ -1238,26 +1555,23 @@ class PD_PT_main(Panel):
         col.operator("pd.load_pack", text="Load Pack").pack_path = (
             host.pd_pack_path
         )
-        if _state["pack"] is None:
-            return
-        col.separator()
-        col.prop(host, "pd_preset_name")
-        row = col.row(align=True)
-        row.operator("pd.save_preset", text="Save").preset_name = (
-            host.pd_preset_name
-        )
-        row.operator("pd.load_preset", text="Load").preset_name = (
-            host.pd_preset_name
-        )
-        row.operator("pd.delete_preset", text="Delete").preset_name = (
-            host.pd_preset_name
-        )
-        col.prop(host, "pd_live_update", text="Live Update")
-        col.prop(host, "pd_use_rig", text="Deform With Bones")
         if _state.get("last_error"):
             box = col.box()
             box.label(text="Last error:", icon="ERROR")
             box.label(text=_state["last_error"][:120])
+        if _state["pack"] is None:
+            return
+        col.separator()
+        col.prop(host, "pd_preset_path")
+        row = col.row(align=True)
+        row.operator("pd.save_preset", text="Save").preset_path = (
+            host.pd_preset_path
+        )
+        row.operator("pd.load_preset", text="Load").preset_path = (
+            host.pd_preset_path
+        )
+        col.prop(host, "pd_live_update", text="Live Update")
+        col.prop(host, "pd_use_rig", text="Deform With Bones")
         rig = bpy.data.objects.get(_RIG_NAME)
         if rig is not None:
             col.label(
@@ -1283,6 +1597,7 @@ class PD_PT_main(Panel):
                 icon="HIDE_OFF" if shown else "HIDE_ON",
             )
         col.operator("pd.evaluate", text="Evaluate / Update Mesh")
+        col.operator("pd.detach", text="Detach (Separate Mesh)")
         for action in _state["pack"].actions:
             col.operator(
                 "pd.run_action", text=action.get("label", action.get("id", "Action"))
@@ -1339,6 +1654,7 @@ class PD_PT_main(Panel):
 CLASSES = (
     PD_OT_load_pack,
     PD_OT_evaluate,
+    PD_OT_detach,
     PD_OT_run_action,
     PD_OT_randomize,
     PD_OT_randomize_group,

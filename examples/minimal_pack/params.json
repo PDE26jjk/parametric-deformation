@@ -1,0 +1,23 @@
+[
+ {
+  "id": "identity",
+  "label": "Identity",
+  "group": "Shape",
+  "min": 0.0,
+  "max": 1.0,
+  "default": 0.0,
+  "step": 0.01,
+  "rank": 1,
+  "kind": "linear"
+ },
+ {
+  "id": "stretch",
+  "label": "Stretch",
+  "group": "Skeleton",
+  "min": -1.0,
+  "max": 1.0,
+  "default": 0.0,
+  "step": 0.01,
+  "rank": 2
+ }
+]

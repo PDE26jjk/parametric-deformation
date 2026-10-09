@@ -255,6 +255,15 @@ def main() -> None:
     parametric_deformation.register()
     assert bpy.ops.pd.load_pack(pack_path=pack_dir) == {"FINISHED"}
     assert bpy.ops.pd.evaluate() == {"FINISHED"}
+    # Avatar-shaped expectations (a 'face' mesh carrying UVs and material
+    # slots, humanoid bone names): skip instead of failing for other packs.
+    face = next((d for d in _state["pack"].mesh_descriptors
+                 if d.get("name") == "face"), None)
+    if face is None or not face.get("uv"):
+        print("RIG CHECK SKIP pack has no avatar-style 'face' mesh with UVs")
+        parametric_deformation.unregister()
+        bpy.ops.wm.quit_blender()
+        return
     for i, name in enumerate(MESH_ORDER):
         obj_name = "PD_Avatar" if i == 0 else f"PD_Avatar_{name}"
         obj = bpy.data.objects.get(obj_name)

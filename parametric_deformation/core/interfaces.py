@@ -41,6 +41,19 @@ class TemplateAdapter(ABC):
         """Export mapping; interface only until researched."""
         return {"expressions": {}, "humanoid_bones": {}}
 
+    def detach_shape_keys(self) -> list[dict]:
+        """Shape keys to bake when the user detaches the meshes.
+
+        Every entry is ``{"name": str, "params": {param_id: value}}`` and is
+        evaluated on top of the current slider values.  The parameters a key
+        touches are zeroed for the basis, so the key carries the difference
+        between "slider at 0" and "slider at 1".
+
+        Templates with nothing to bake return an empty list, and detaching then
+        just copies the evaluated meshes out of the add-on.
+        """
+        return []
+
     # --- Pipeline hooks (default no-ops) ---------------------------------
     def on_before_semantic(self, params: dict, ctx: dict) -> dict:
         return params

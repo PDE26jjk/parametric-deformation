@@ -1,0 +1,9 @@
+{
+ "id": "minimal_pack",
+ "name": "Minimal Example Pack",
+ "version": "1.0.0",
+ "format_version": "1",
+ "dependencies": [
+  "numpy"
+ ]
+}

@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from . import math_utils
-from .config import load_data_array
+from .config import PackError, load_data_array
 from .interfaces import MeshResult, TemplateAdapter
 
 
@@ -66,6 +66,12 @@ class GenericAdapter(TemplateAdapter):
 
     def _weights(self) -> np.ndarray:
         if self._weights_arr is None:
+            if not self._weights_file:
+                raise PackError(
+                    "pack has no lbs/weights.npz: the generic adapter needs "
+                    "skinning weights, or the pack must override lbs_skin() "
+                    "in its py/driver.py"
+                )
             npz = np.load(self._weights_file)
             self._weights_arr = npz[npz.files[0]]
         return self._weights_arr

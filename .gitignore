@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Scratch space for the headless checks and probes
+.test_tmp/
+.previews/
+
+# Extension builds
+dist/
+*.zip
+
+# IDE / OS
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
+
+# Blender backups
+*.blend1
